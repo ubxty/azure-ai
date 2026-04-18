@@ -1,0 +1,54 @@
+{
+    "name": "ubxty/azure-ai",
+    "description": "Azure OpenAI integration for Laravel — chat, streaming, multi-key rotation, cost tracking.",
+    "keywords": ["laravel", "azure", "openai", "ai", "gpt", "chatgpt", "streaming"],
+    "license": "MIT",
+    "version": "1.0.0",
+    "type": "library",
+    "authors": [
+        {
+            "name": "Ubxty",
+            "email": "info.ubxty@gmail.com"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "ubxty/core-ai": "^1.0",
+        "illuminate/support": "^11.0|^12.0",
+        "illuminate/http": "^11.0|^12.0",
+        "illuminate/cache": "^11.0|^12.0",
+        "illuminate/console": "^11.0|^12.0",
+        "illuminate/contracts": "^11.0|^12.0",
+        "illuminate/database": "^11.0|^12.0",
+        "illuminate/routing": "^11.0|^12.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0|^10.0",
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Ubxty\\AzureAi\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ubxty\\AzureAi\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Ubxty\\AzureAi\\AzureAiServiceProvider"
+            ],
+            "aliases": {
+                "Azure": "Ubxty\\AzureAi\\Facades\\Azure"
+            }
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
