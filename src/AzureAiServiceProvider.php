@@ -25,10 +25,6 @@ class AzureAiServiceProvider extends ServiceProvider
                 __DIR__.'/../config/azure-ai.php' => config_path('azure-ai.php'),
             ], 'azure-ai-config');
 
-            $this->publishes([
-                __DIR__.'/../database/migrations/' => database_path('migrations'),
-            ], 'azure-ai-migrations');
-
             $this->commands([
                 Commands\ChatCommand::class,
                 Commands\ConfigureCommand::class,
@@ -37,8 +33,6 @@ class AzureAiServiceProvider extends ServiceProvider
                 Commands\DefaultModelCommand::class,
             ]);
         }
-
-        $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
 
         $this->registerHealthCheckRoute();
     }

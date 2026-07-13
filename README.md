@@ -3,7 +3,7 @@
 [![Latest Version on Packagist](https://img.shields.io/packagist/v/ubxty/azure-ai.svg?style=flat-square)](https://packagist.org/packages/ubxty/azure-ai)
 [![License](https://img.shields.io/packagist/l/ubxty/azure-ai.svg?style=flat-square)](LICENSE)
 
-**Azure OpenAI integration for Laravel.** Chat, multi-turn conversations, streaming, multi-key rotation, model syncing, cost tracking, and powerful CLI tools — all built on `ubxty/core-ai`.
+**Azure OpenAI integration for Laravel.** Chat, multi-turn conversations, streaming, multi-key rotation, config-driven model catalogue, cost tracking, and powerful CLI tools — all built on `ubxty/core-ai`.
 
 ---
 
@@ -27,11 +27,7 @@ Publish the config file:
 php artisan vendor:publish --tag=azure-ai-config
 ```
 
-Run the migrations:
-
-```bash
-php artisan migrate
-```
+No database migration is required. The model catalogue is config-driven (see the `models` block in `config/azure-ai.php`); if left empty, the package falls back to a live call against the Azure OpenAI `/openai/models` data-plane endpoint (cached via Laravel cache).
 
 ---
 

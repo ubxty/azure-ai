@@ -2,12 +2,9 @@
 
 namespace Ubxty\AzureAi;
 
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schema;
 use Ubxty\AzureAi\Client\AzureClient;
 use Ubxty\AzureAi\Client\AzureCredentialManager;
 use Ubxty\AzureAi\Events\AzureInvoked;
-use Ubxty\AzureAi\Exceptions\AzureException;
 use Ubxty\CoreAi\Exceptions\ConfigurationException;
 use Ubxty\CoreAi\Manager\AbstractAiManager;
 use Ubxty\CoreAi\Models\ModelSpecResolver;
@@ -167,65 +164,73 @@ class AzureManager extends AbstractAiManager
         return $models;
     }
 
+    /**
+     * Sync models for the given connection.
+     *
+     * Since 1.1.0, the catalogue is config-driven (see config/azure-ai.php
+     * `models` block). This method returns the count of models configured
+     * for the connection. {@see AbstractAiManager::getModelsGrouped()}
+     * falls back to a live {@see fetchModels()} call when config is empty.
+     */
     public function syncModels(?string $connection = null): int
     {
         $connection ??= $this->config['default'] ?? 'default';
-        $models = $this->fetchModels($connection);
-        $now = now();
 
-        if (! Schema::hasTable('azure_models')) {
-            throw new AzureException(
-                'The azure_models table does not exist. Run: php artisan migrate'
-            );
-        }
-
-        foreach ($models as $model) {
-            DB::table('azure_models')->upsert(
-                [
-                    'model_id' => $model['model_id'],
-                    'name' => $model['name'],
-                    'provider' => $model['provider'],
-                    'connection' => $connection,
-                    'context_window' => $model['context_window'],
-                    'max_tokens' => $model['max_tokens'],
-                    'capabilities' => json_encode($model['capabilities']),
-                    'input_modalities' => json_encode($model['input_modalities'] ?? ['text']),
-                    'is_active' => $model['is_active'] ? 1 : 0,
-                    'lifecycle_status' => $model['is_active'] ? 'ACTIVE' : 'INACTIVE',
-                    'synced_at' => $now,
-                    'created_at' => $now,
-                    'updated_at' => $now,
-                ],
-                ['model_id'],
-                ['name', 'provider', 'connection', 'context_window', 'max_tokens', 'capabilities', 'input_modalities', 'is_active', 'lifecycle_status', 'synced_at', 'updated_at']
-            );
-        }
-
-        return count($models);
+        return count($this->getConfiguredModels($connection));
     }
 
     protected function fetchModelsForGrouping(?string $connection): array
     {
-        try {
-            return DB::table('azure_models')
-                ->when($connection, fn ($q) => $q->where('connection', $connection))
-                ->orderBy('provider')
-                ->orderBy('name')
-                ->get()
-                ->map(fn ($row) => [
-                    'model_id' => $row->model_id,
-                    'name' => $row->name,
-                    'provider' => $row->provider,
-                    'context_window' => $row->context_window,
-                    'max_tokens' => $row->max_tokens,
-                    'capabilities' => json_decode($row->capabilities, true) ?? [],
-                    'input_modalities' => json_decode($row->input_modalities ?? 'null', true) ?? ['text'],
-                    'is_active' => (bool) $row->is_active,
-                ])
-                ->all();
-        } catch (\Throwable) {
+        $models = $this->getConfiguredModels($connection ?? $this->config['default'] ?? 'default');
+
+        return array_values(array_map(
+            fn (string $modelId, array $spec): array => [
+                'model_id'         => $modelId,
+                'name'             => $spec['name'] ?? $modelId,
+                'provider'         => $spec['provider'] ?? 'Other',
+                'context_window'   => (int) ($spec['context_window'] ?? 0),
+                'max_tokens'       => (int) ($spec['max_tokens'] ?? 0),
+                'capabilities'     => (array) ($spec['capabilities'] ?? []),
+                'input_modalities' => (array) ($spec['input_modalities'] ?? ['text']),
+                'is_active'        => (bool) ($spec['is_active'] ?? true),
+            ],
+            array_keys($models),
+            array_values($models),
+        ));
+    }
+
+    /**
+     * Read models for a connection from the config `models` block.
+     *
+     * Supports two shapes:
+     *   1. Per-connection: ['default' => ['my-gpt-4o' => ['provider' => '…']]]
+     *   2. Flat-indexed-by-deployment-name (deployment names are unique per
+     *      Azure resource): ['my-gpt-4o' => ['provider' => '…']]
+     *
+     * In the flat shape, an entry with `'connection' => 'other'` is filtered
+     * out when querying for `'default'`.
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    protected function getConfiguredModels(string $connection): array
+    {
+        $all = $this->config['models'] ?? [];
+
+        if (! is_array($all)) {
             return [];
         }
+
+        // Per-connection shape: top-level key is the connection name.
+        if (isset($all[$connection]) && is_array($all[$connection])) {
+            return $all[$connection];
+        }
+
+        // Flat shape: filter entries whose explicit 'connection' pin does not match.
+        return array_filter(
+            $all,
+            fn ($spec) => is_array($spec)
+                && (! isset($spec['connection']) || $spec['connection'] === $connection),
+        );
     }
 
     public function isConfigured(?string $connection = null): bool

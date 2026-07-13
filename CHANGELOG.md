@@ -6,6 +6,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and 
 
 ---
 
+## [1.1.0] - 2026-07-13
+
+### Removed
+- **`azure_models` database table** and its migration (`create_azure_models_table`). Models are now defined in config only. The host app no longer runs a migration to install this package.
+- **`AzureAiServiceProvider`** no longer publishes or auto-loads migrations (`azure-ai-migrations` tag removed).
+
+### Changed
+- **`AzureManager::syncModels()`** — no longer writes to DB. Returns the count of models configured for the given connection (read from `config('azure-ai.models')`). Signature and return type unchanged for BC.
+- **`AzureManager::fetchModelsForGrouping()`** — reads from `config('azure-ai.models')` instead of the DB. Empty array still triggers the parent's live `fetchModels()` fallback (cached Azure OpenAI `/openai/models` data-plane call).
+- **`AzureManager`** dropped unused `DB`, `Schema`, and `AzureException` imports.
+
+### Added
+- **`config/azure-ai.php` `models` block** — keyed by deployment name. Supports flat-indexed and per-connection shapes. Override via `AZURE_OPENAI_MODELS` env (JSON). See config comments for shape examples.
+
+### Migration from <= 1.0.x
+1. Drop the table: `php artisan migrate:rollback --path=vendor/ubxty/azure-ai/database/migrations` (or drop manually).
+2. Move any previously-synced models into `config/azure-ai.php` under the new `'models'` key.
+
+---
+
 ## [1.0.0] - 2026-04-18
 
 ### Added

@@ -119,6 +119,50 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Model Catalogue
+    |--------------------------------------------------------------------------
+    |
+    | Define the deployments you want surfaced by
+    | {@see AzureManager::getModelsGrouped()}. Two shapes are supported
+    | (flat is recommended — deployment names are unique per Azure resource):
+    |
+    |   Flat (recommended):
+    |     'models' => [
+    |       'my-gpt-4o-deployment' => [
+    |         'name' => 'GPT-4o', 'provider' => 'OpenAI',
+    |         'context_window' => 128000, 'max_tokens' => 16384,
+    |         'capabilities' => ['text', 'vision'], 'input_modalities' => ['text', 'image'],
+    |         'is_active' => true,
+    |       ],
+    |     ],
+    |
+    |   Per-connection:
+    |     'models' => [
+    |       'default' => [ 'my-gpt-4o-deployment' => [ … ] ],
+    |       'secondary' => [ 'my-gpt-4o-mini-deployment' => [ … ] ],
+    |     ],
+    |
+    | In the flat shape, an entry with an explicit `'connection' => '…'` key
+    | is filtered out when querying other connections.
+    |
+    | Leave empty to fall back to a live call against the Azure OpenAI
+    | /openai/models data-plane endpoint (cached via Laravel cache for
+    | cache.models_ttl). AI Foundry endpoints that don't expose /models
+    | return [] gracefully.
+    |
+    | Override via AZURE_OPENAI_MODELS env (JSON):
+    |   AZURE_OPENAI_MODELS='{"my-gpt-4o-deployment":{"provider":"OpenAI",…}}'
+    |
+    */
+    'models' => array_filter([
+        'default' => array_filter(array_map(
+            fn ($m) => is_array($m) ? $m : null,
+            json_decode((string) env('AZURE_OPENAI_MODELS', '[]'), true) ?: [],
+        )),
+    ]),
+
+    /*
+    |--------------------------------------------------------------------------
     | Invocation Logging
     |--------------------------------------------------------------------------
     */
