@@ -6,3 +6,20 @@
 *.swp
 *.swo
 .DS_Store
+
+# secrets / env
+.env
+.env.*
+!.env.example
+
+# private keys / certs
+*.pem
+*.key
+*.crt
+*.p12
+
+# audit scratch
+bugs*.md
+BUGS*.MD
+test_*.php
+test_*.log
