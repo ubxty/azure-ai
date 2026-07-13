@@ -2,9 +2,12 @@
 
 namespace Ubxty\AzureAi;
 
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
 use Ubxty\AzureAi\Client\AzureClient;
 use Ubxty\AzureAi\Client\AzureCredentialManager;
 use Ubxty\AzureAi\Events\AzureInvoked;
+use Ubxty\AzureAi\Exceptions\AzureException;
 use Ubxty\CoreAi\Exceptions\ConfigurationException;
 use Ubxty\CoreAi\Manager\AbstractAiManager;
 use Ubxty\CoreAi\Models\ModelSpecResolver;
@@ -46,6 +49,7 @@ class AzureManager extends AbstractAiManager
         );
 
         $client->setModelsCacheTtl($this->config['cache']['models_ttl'] ?? 3600);
+        $client->setPromptCachePoints($this->promptCachePoints());
 
         $this->clients[$connection] = $client;
 
@@ -67,12 +71,17 @@ class AzureManager extends AbstractAiManager
     ): array {
         $startTime = microtime(true);
 
+        // Deterministic Idempotency-Key over (modelId, system, user) so a network
+        // blip retries as the same request rather than a fresh billing event (v2.1.0).
+        $idempotencyKey = hash('sha256', $modelId.'|'.$systemPrompt.'|'.$userMessage);
+
         $result = $this->client($connection)->converse(
             $modelId,
             [['role' => 'user', 'content' => $userMessage]],
             $systemPrompt,
             $maxTokens,
             $temperature,
+            $idempotencyKey,
         );
 
         $cost = $this->calculateCost($result['input_tokens'], $result['output_tokens'], $pricing);
@@ -290,5 +299,122 @@ class AzureManager extends AbstractAiManager
                 keyUsed: $result['key_used'] ?? 'unknown',
             ));
         }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  v2.1.0 — prompt-cache config + embeddings
+    // ─────────────────────────────────────────────────────────
+
+    /**
+     * Read the configured prompt-cache checkpoint anchors
+     * (`core-ai.azure_ai.prompt_caching.points`), filtered to the supported set.
+     *
+     * @return string[]
+     */
+    protected function promptCachePoints(): array
+    {
+        $configured = $this->config['prompt_caching']['points'] ?? [];
+
+        if (! is_array($configured)) {
+            return [];
+        }
+
+        return array_values(array_filter(
+            array_map('strval', $configured),
+            fn (string $p) => in_array($p, ['system', 'last_user'], true),
+        ));
+    }
+
+    /**
+     * Generate embeddings for a batch of texts using the Azure OpenAI
+     * /embeddings endpoint. Cached per `(deploymentId, sha256(text))` for
+     * `core-ai.cache.embedding_ttl` seconds (default 7 days).
+     *
+     * @param  string[]  $texts
+     * @param  string  $user  Optional user-id header for abuse detection.
+     * @return array<int, float[]>
+     */
+    public function embed(
+        string $deploymentId,
+        array $texts,
+        ?int $dimensions = null,
+        ?string $user = null,
+        ?string $connection = null,
+    ): array {
+        $deploymentId = $this->resolveAlias($deploymentId);
+
+        $ttl = (int) ($this->config['cache']['embedding_ttl']
+            ?? config('core-ai.cache.embedding_ttl', 604800));
+
+        $cm = new AzureCredentialManager(
+            $this->config['connections'][$connection ?? $this->config['default'] ?? 'default']['keys'] ?? []
+        );
+
+        $key = $cm->current();
+        $endpoint = $key['endpoint'];
+        $apiVersion = $key['api_version'] ?? '2024-10-21';
+        $apiKey = $key['api_key'];
+        $base = rtrim($endpoint, '/');
+
+        $results = [];
+        $pending = [];
+
+        foreach ($texts as $i => $text) {
+            $hash = hash('sha256', $deploymentId.'|'.((string) $dimensions).'|'.$text);
+            $cacheKey = "azure_ai_embeddings_{$hash}";
+            $cached = Cache::get($cacheKey);
+            if (is_array($cached)) {
+                $results[$i] = $cached;
+            } else {
+                $pending[$i] = $text;
+            }
+        }
+
+        foreach ($pending as $i => $text) {
+            $body = ['input' => $text];
+            if ($dimensions !== null) {
+                $body['dimensions'] = $dimensions;
+            }
+
+            $headers = [
+                'api-key' => $apiKey,
+                'Content-Type' => 'application/json',
+            ];
+            if ($user !== null && $user !== '') {
+                $headers['x-ms-user-agent'] = $user;
+            }
+
+            $url = $this->isV1EndpointForEmbed($base)
+                ? "{$base}/embeddings"
+                : "{$base}/openai/deployments/{$deploymentId}/embeddings?api-version={$apiVersion}";
+
+            $response = Http::withHeaders($headers)->timeout(60)->post($url, $body);
+
+            if (! $response->successful()) {
+                throw new AzureException("Azure embed HTTP {$response->status()}: ".$response->body(), $response->status());
+            }
+
+            $vec = $response->json('data.0.embedding') ?? [];
+
+            if (! is_array($vec) || empty($vec)) {
+                throw new AzureException("Azure embed returned no vector for text index {$i}");
+            }
+
+            $hash = hash('sha256', $deploymentId.'|'.((string) $dimensions).'|'.$text);
+            Cache::put("azure_ai_embeddings_{$hash}", $vec, $ttl);
+            $results[$i] = $vec;
+        }
+
+        ksort($results);
+
+        return array_values($results);
+    }
+
+    /**
+     * Heuristic to detect v1 (OpenAI-compatible) endpoints for the embeddings URL.
+     */
+    private function isV1EndpointForEmbed(string $endpoint): bool
+    {
+        return str_ends_with($endpoint, '/v1') || str_contains($endpoint, '/v1/');
     }
 }

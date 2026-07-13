@@ -117,6 +117,28 @@ AZURE_OPENAI_MODELS='{"my-gpt-4o-deployment":{"provider":"OpenAI","context_windo
 
 ---
 
+### Prompt Caching (v2.1.0+)
+
+Azure OpenAI supports `cache_control: { type: 'ephemeral' }` markers on chat completion content parts. Subsequent calls with the same prefix within the cache TTL are charged ~10% of the normal input rate. Configure the named anchors where the package injects a marker:
+
+```env
+AZURE_OPENAI_PROMPT_CACHE_POINTS=system,last_user   # or just one of them
+```
+
+Or in `config/core-ai.php`:
+
+```php
+'azure_ai' => [
+    'prompt_caching' => [
+        'points' => ['system', 'last_user'],
+    ],
+],
+```
+
+Supported anchors: `system` (on the system message's last eligible content part) and `last_user` (on the last user message's last eligible content part). Empty `points` disables.
+
+---
+
 ## Usage
 
 ### Facade

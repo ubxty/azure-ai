@@ -144,10 +144,11 @@ class AzureClient
         string $systemPrompt = '',
         int $maxTokens = 4096,
         float $temperature = 0.7,
+        ?string $idempotencyKey = null,
     ): array {
         $startTime = microtime(true);
 
-        return $this->withRetry($deploymentId, function (string $resolvedId, array $key) use ($messages, $systemPrompt, $maxTokens, $temperature, $startTime) {
+        return $this->withRetry($deploymentId, function (string $resolvedId, array $key) use ($messages, $systemPrompt, $maxTokens, $temperature, $idempotencyKey, $startTime) {
             $endpoint = $key['endpoint'];
             $apiVersion = $key['api_version'] ?? '2024-10-21';
             $apiKey = $key['api_key'];
@@ -155,8 +156,11 @@ class AzureClient
 
             $url = $this->buildChatUrl($endpoint, $resolvedId, $apiVersion);
 
+            $formattedMessages = $this->formatMessages($messages, $systemPrompt);
+            [$formattedMessages] = $this->applyCacheControl($formattedMessages);
+
             $body = [
-                'messages' => $this->formatMessages($messages, $systemPrompt),
+                'messages' => $formattedMessages,
                 'temperature' => $temperature,
             ];
 
@@ -169,9 +173,12 @@ class AzureClient
                 $body['max_tokens'] = $maxTokens;
             }
 
-            $response = Http::withHeaders(
-                $this->getAuthHeaders($endpoint, $apiKey) + ['Content-Type' => 'application/json']
-            )->timeout(120)->post($url, $body);
+            $headers = $this->getAuthHeaders($endpoint, $apiKey) + ['Content-Type' => 'application/json'];
+            if ($idempotencyKey !== null && $idempotencyKey !== '') {
+                $headers['Idempotency-Key'] = $idempotencyKey;
+            }
+
+            $response = Http::withHeaders($headers)->timeout(120)->post($url, $body);
 
             if (! $response->successful()) {
                 $this->handleErrorResponse($response);
@@ -693,6 +700,78 @@ class AzureClient
     //  Error handling
     // ─────────────────────────────────────────────────────────
 
+    // ─────────────────────────────────────────────────────────
+    //  Prompt Caching (v2.1.0+)
+    // ─────────────────────────────────────────────────────────
+
+    /**
+     * Inject `cache_control: { type: 'ephemeral' }` markers into the chat body
+     * at the configured named anchors. Azure OpenAI's cache_control marker goes
+     * on individual content items, not on the message envelope.
+     *
+     * Currently supported anchors:
+     *   - 'system'    — add cache_control to the system message's content.
+     *   - 'last_user' — add cache_control to the last user message's last text part.
+     *
+     * @param  array<int, array{role: string, content: string|array<int, mixed>}>  $messages
+     * @return array{0: array<int, array{role: string, content: string|array<int, mixed>}>}
+     */
+    protected function applyCacheControl(array $messages): array
+    {
+        if (empty($this->promptCachePoints)) {
+            return [$messages];
+        }
+
+        if (in_array('system', $this->promptCachePoints, true) && ! empty($messages)
+            && ($messages[0]['role'] ?? null) === 'system') {
+            $messages[0] = $this->annotateMessageContent($messages[0]);
+        }
+
+        if (in_array('last_user', $this->promptCachePoints, true)) {
+            for ($i = count($messages) - 1; $i >= 0; $i--) {
+                if (($messages[$i]['role'] ?? null) === 'user') {
+                    $messages[$i] = $this->annotateMessageContent($messages[$i]);
+                    break;
+                }
+            }
+        }
+
+        return [$messages];
+    }
+
+    /**
+     * Add `cache_control: { type: 'ephemeral' }` to the last eligible content
+     * part of the given message. Plain-string content is converted to a parts
+     * array first. Only text and image_url parts can carry the marker.
+     */
+    protected function annotateMessageContent(array $message): array
+    {
+        $content = $message['content'] ?? '';
+
+        if (is_string($content)) {
+            $content = [['type' => 'text', 'text' => $content]];
+        } elseif (! is_array($content)) {
+            return $message;
+        }
+
+        if (empty($content)) {
+            return $message;
+        }
+
+        // Find the last text or image_url part and attach the cache marker.
+        for ($i = count($content) - 1; $i >= 0; $i--) {
+            $type = $content[$i]['type'] ?? null;
+            if ($type === 'text' || $type === 'image_url') {
+                $content[$i]['cache_control'] = ['type' => 'ephemeral'];
+                break;
+            }
+        }
+
+        $message['content'] = $content;
+
+        return $message;
+    }
+
     /**
      * Handle a non-successful HTTP response from Azure.
      *
@@ -705,6 +784,11 @@ class AzureClient
         $message = $body['error']['message'] ?? $response->body();
 
         if ($status === 429) {
+            // Honour the upstream Retry-After hint when present (v2.1.0).
+            $retryAfter = $response->header('Retry-After');
+            if ($retryAfter !== null) {
+                $this->setRetryAfterSeconds((int) $retryAfter);
+            }
             throw new RateLimitException("429 Too many requests: {$message}", 429);
         }
 

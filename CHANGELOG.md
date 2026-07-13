@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and 
 
 ---
 
+## [2.1.0] - 2026-07-13
+
+### Added
+- **`cache_control` injection on chat completion bodies.** `AzureClient::converse()` now applies `applyCacheControl()` after `formatMessages()` to attach `cache_control: { type: 'ephemeral' }` markers to the system message and/or last user message's last eligible content part (text or image_url). Azure OpenAI then charges ~10% of the normal input rate for the cached prefix on subsequent calls within the cache TTL. Configured via `core-ai.azure_ai.prompt_caching.points` (env: `AZURE_OPENAI_PROMPT_CACHE_POINTS`).
+
+- **`Idempotency-Key` header on chat completion requests.** `AzureClient::converse()` accepts an optional `?string $idempotencyKey` last parameter and, when present, attaches it as the `Idempotency-Key` header. `AzureManager::performInvoke()` generates a deterministic `sha256(modelId|system|user)` key and passes it through, so a network blip retries as the same request rather than a fresh billing event.
+
+- **`Retry-After` honouring in the canonical `HasRetryLogic`** (added in `ubxty/core-ai` 2.1.1). When `handleErrorResponse()` parses a 429 response, the `Retry-After` header value is captured and consumed by `withRetry()` in preference to the exponential backoff.
+
+- **`AzureManager::embed($deploymentId, array $texts, ?int $dimensions, ?string $user, ?string $connection)`** — batch embedding endpoint using the Azure OpenAI `/embeddings` data-plane (or `/v1/embeddings` for AI Foundry endpoints). Cached per `(deploymentId, dimensions, sha256(text))` for `core-ai.cache.embedding_ttl` seconds (default 7 days).
+
+### Changed
+- `AzureClient::converse()` accepts an optional `?string $idempotencyKey = null` last parameter. Existing 5-arg calls keep working — fully backward-compatible.
+- `AzureManager::performInvoke()` now generates an Idempotency-Key and propagates it to the underlying converse call. No signature change.
+
+### Notes
+- Requires `ubxty/core-ai ^2.1` (specifically 2.1.1, which added the canonical `HasRetryLogic::setPromptCachePoints()` / `setRetryAfterSeconds()` hooks that this release depends on).
+- All additions are backward-compatible. No `cache_control` is injected unless `azure_ai.prompt_caching.points` is non-empty, no `Idempotency-Key` is attached unless the caller provides one, and `embed()` is a new method callers opt into.
+
+---
+
 ## [2.0.0] - 2026-07-13
 
 ### BREAKING CHANGES
