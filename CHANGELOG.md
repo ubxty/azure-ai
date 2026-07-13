@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and 
 
 ---
 
+## [2.1.1] - 2026-07-13
+
+### Documentation
+- README rewritten from scratch (245 → 767 lines). Adds an `Endpoint flavours` section explaining traditional data-plane vs Microsoft Foundry v1 with the wire-format differences (`max_tokens` vs `max_completion_tokens`, `api-key` vs `Authorization: Bearer`).
+- Adds a `Cost Optimisations (v2.1.x)` section summarising all 7 cost levers with `cache_control` injection, response cache, embedding cache, Idempotency-Key, and Retry-After.
+- Adds the `AzureManager API` reference table covering inherited core-ai methods + Azure-specific helpers (`embed()`, `testConnection()`, `isConfigured()`, `fetchModels()`, `listModels()`, `client()`, `getCredentialInfo()`).
+- Adds the `embed()` reference with supported deployments (`text-embedding-3-small` / `-large` / `ada-002`), endpoint routing table for v1 vs traditional, and `dimensions` semantics for the v3 family.
+- Adds a `Configure` section laying out the full `azure_ai.*` config tree.
+- Adds a `Multi-key failover` section showing per-key `endpoint + api_key + api_version` configuration.
+- Adds `Health check` and `API versions` sections.
+- Adds `Multimodal` example (`userWithImage`) for the conversation builder.
+- New `/docs/` cookbook (6 files): `getting-started.md`, `endpoint-flavours.md`, `caching-strategy.md`, `embeddings.md`, `real-world-patterns.md`, `faq.md`.
+
+---
+
 ## [2.1.0] - 2026-07-13
 
 ### Added
