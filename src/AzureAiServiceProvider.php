@@ -9,10 +9,8 @@ class AzureAiServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
-        $this->mergeConfigFrom(__DIR__.'/../config/azure-ai.php', 'azure-ai');
-
         $this->app->singleton(AzureManager::class, function ($app) {
-            return new AzureManager($app['config']->get('azure-ai', []));
+            return new AzureManager($app['config']->get('core-ai.azure_ai', []));
         });
 
         $this->app->alias(AzureManager::class, 'azure-ai');
@@ -21,10 +19,6 @@ class AzureAiServiceProvider extends ServiceProvider
     public function boot(): void
     {
         if ($this->app->runningInConsole()) {
-            $this->publishes([
-                __DIR__.'/../config/azure-ai.php' => config_path('azure-ai.php'),
-            ], 'azure-ai-config');
-
             $this->commands([
                 Commands\ChatCommand::class,
                 Commands\ConfigureCommand::class,
@@ -39,7 +33,7 @@ class AzureAiServiceProvider extends ServiceProvider
 
     protected function registerHealthCheckRoute(): void
     {
-        $config = $this->app['config']->get('azure-ai.health_check', []);
+        $config = $this->app['config']->get('core-ai.azure_ai.health_check', []);
 
         if (! ($config['enabled'] ?? false)) {
             return;

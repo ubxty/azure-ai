@@ -356,7 +356,7 @@ class AzureClient
             if ($v1) {
                 $apiKey = $key['api_key'];
                 $base = $this->normalizeEndpoint($endpoint);
-                $defaultModel = config('azure-ai.defaults.model', '');
+                $defaultModel = config('core-ai.azure_ai.defaults.model', '');
 
                 // If no default model is configured, we can only verify the
                 // endpoint is reachable (the expected error tells us it works).

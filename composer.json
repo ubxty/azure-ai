@@ -3,7 +3,7 @@
     "description": "Azure OpenAI integration for Laravel — chat, streaming, multi-key rotation, cost tracking.",
     "keywords": ["laravel", "azure", "openai", "ai", "gpt", "chatgpt", "streaming"],
     "license": "MIT",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "type": "library",
     "authors": [
         {
@@ -13,7 +13,7 @@
     ],
     "require": {
         "php": "^8.2",
-        "ubxty/core-ai": "^1.0",
+        "ubxty/core-ai": "^2.0",
         "illuminate/support": "^11.0|^12.0",
         "illuminate/http": "^11.0|^12.0",
         "illuminate/cache": "^11.0|^12.0",

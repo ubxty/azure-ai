@@ -24,10 +24,10 @@ composer require ubxty/azure-ai
 Publish the config file:
 
 ```bash
-php artisan vendor:publish --tag=azure-ai-config
+php artisan vendor:publish --tag=core-ai-config
 ```
 
-No database migration is required. The model catalogue is config-driven (see the `models` block in `config/azure-ai.php`); if left empty, the package falls back to a live call against the Azure OpenAI `/openai/models` data-plane endpoint (cached via Laravel cache).
+No database migration is required. The model catalogue is config-driven (see the `azure_ai.models` block in `config/core-ai.php`); if left empty, the package falls back to a live call against the Azure OpenAI `/openai/models` data-plane endpoint (cached via Laravel cache).
 
 ---
 
@@ -48,13 +48,15 @@ For multi-key rotation, publish the config and define multiple keys under `conne
 
 The list of deployments surfaced by `Azure::getModelsGrouped()`, `azure:models`, and the interactive pickers (`azure:test`, `azure:default-model`) is **config-driven** since 1.1.0 — no database table, no migration step.
 
-Configure deployments in `config/azure-ai.php` under the `models` key. Two shapes are supported (flat is recommended; deployment names are unique per Azure resource):
+Configure deployments in `config/core-ai.php` under the `azure_ai.models` key. Two shapes are supported (flat is recommended; deployment names are unique per Azure resource):
 
 **Flat-indexed by deployment name (recommended):**
 
 ```php
-// config/azure-ai.php
-'models' => [
+// config/core-ai.php — under the 'azure_ai' key
+'azure_ai' => [
+    // ...
+    'models' => [
     'my-gpt-4o-deployment' => [
         'name'             => 'GPT-4o',
         'provider'         => 'OpenAI',
@@ -98,7 +100,7 @@ AZURE_OPENAI_MODELS='{"my-gpt-4o-deployment":{"provider":"OpenAI","context_windo
 
 **Fallback to live API** — if the `models` block is empty (the default), `Azure::getModelsGrouped()` falls back to a live call against the Azure OpenAI `/openai/models` data-plane endpoint, cached via Laravel cache for `cache.models_ttl` seconds (default 3600). AI Foundry endpoints that don't expose `/models` return `[]` gracefully — define your deployments in config in that case.
 
-**`syncModels()` behaviour change** — since 1.1.0, `Azure::syncModels(?string $connection)` no longer writes to a database. It returns the count of deployments configured for the given connection (read from `config('azure-ai.models')`). The signature and return type are unchanged for BC.
+**`syncModels()` behaviour change** — since 1.1.0, `Azure::syncModels(?string $connection)` no longer writes to a database. It returns the count of deployments configured for the given connection (read from `config('core-ai.azure_ai.models')`). The signature and return type are unchanged for BC.
 
 **Available spec keys** (all optional except `model_id`, which is the array key in flat shape):
 

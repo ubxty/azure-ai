@@ -167,8 +167,9 @@ class AzureManager extends AbstractAiManager
     /**
      * Sync models for the given connection.
      *
-     * Since 1.1.0, the catalogue is config-driven (see config/azure-ai.php
-     * `models` block). This method returns the count of models configured
+     * Since 1.1.0, the catalogue is config-driven (see core-ai
+     * `azure_ai.models` block in config/core-ai.php since 2.0.0). This
+     * method returns the count of models configured
      * for the connection. {@see AbstractAiManager::getModelsGrouped()}
      * falls back to a live {@see fetchModels()} call when config is empty.
      */

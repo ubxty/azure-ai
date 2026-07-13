@@ -6,6 +6,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and 
 
 ---
 
+## [2.0.0] - 2026-07-13
+
+### BREAKING CHANGES
+
+- **Consolidated config in `core-ai`.** Azure-specific config previously in `config/azure-ai.php` is now in `config/core-ai.php` under the `azure_ai` key. Host apps that published the old `azure-ai-config` tag must republish via `core-ai-config` and merge their overrides under the new namespace.
+- **Config namespace change.** `config('azure-ai.*')` is now `config('core-ai.azure_ai.*')`. Update any direct references in your application code.
+- **Publish tag `azure-ai-config` removed.** Only `core-ai-config` is published.
+- **Requires `ubxty/core-ai ^2.0`** (companion 2.0.0 release).
+
+### Removed
+- `config/azure-ai.php` — moved to core-ai's `core-ai.php` under the `azure_ai` key.
+
+### Changed
+- `AzureAiServiceProvider::register()` — `AzureManager` singleton now binds from `config('core-ai.azure_ai', [])` instead of `config('azure-ai', [])`.
+- `AzureAiServiceProvider::boot()` — no longer publishes `azure-ai-config`; that tag lives in `ubxty/core-ai`.
+- `AzureAiServiceProvider::registerHealthCheckRoute()` — reads from `config('core-ai.azure_ai.health_check', [])`.
+- `Client/AzureClient` — `defaults.model` lookup updated to `config('core-ai.azure_ai.defaults.model', '')`.
+
+### Migration from 1.x
+1. `composer require ubxty/azure-ai:^2.0` (auto-pulls `ubxty/core-ai ^2.0`)
+2. `php artisan vendor:publish --tag=core-ai-config` to publish the new consolidated config
+3. Move any customisations from `config/azure-ai.php` into `config/core-ai.php` under the `azure_ai` key
+4. In your application code, replace `config('azure-ai.*')` with `config('core-ai.azure_ai.*')`
+
+---
+
 ## [1.1.0] - 2026-07-13
 
 ### Removed
