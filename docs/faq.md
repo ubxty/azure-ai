@@ -38,7 +38,7 @@ A: Yes — `azure_ai.connections.default` + `azure_ai.connections.prod`. Switch 
 A: `config/core-ai.php` → `azure_ai.connections.default.keys[]`. See [`getting-started.md`](getting-started.md) §10.
 
 **Q: How do I disable the response cache without changing the TTL?**
-A: `config(['core-ai.cache.response_ttl' => 0])` at call time, or vary any of `temperature`, `maxTokens`, `systemPrompt`, `userMessage`, `modelId` (changes the SHA hash).
+A: `config(['core-ai.azure_ai.cache.response_ttl' => 0])` at call time, or vary any of `temperature`, `maxTokens`, `systemPrompt`, `userMessage`, `modelId` (changes the SHA hash). Note: `cache.response_ttl` is **not defined in the published config by default** — publish `core-ai-config` and add the key under `azure_ai.cache.response_ttl` first.
 
 ---
 
@@ -99,7 +99,7 @@ A: They differ. v3-family models truncate the vector when `dimensions < native`.
 A: That's the intended behaviour. Empty arrays produce empty arrays — skip the upstream call entirely.
 
 **Q: Can I cache embeddings indefinitely?**
-A: Yes. Set `core-ai.cache.embedding_ttl` to a long value. The cache key is content-hashed; you don't need to invalidate when text changes (a different hash = a different key).
+A: Yes. Set `core-ai.azure_ai.cache.embedding_ttl` (or the fallback `core-ai.cache.embedding_ttl`) to a long value. The cache key is content-hashed; you don't need to invalidate when text changes (a different hash = a different key).
 
 **Q: `text-embedding-ada-002` ignores `dimensions`?**
 A: Yes — `ada-002` always returns 1536 dimensions. The parameter is silently dropped on that model.

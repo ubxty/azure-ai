@@ -65,7 +65,7 @@ What this package adds on top:
 composer require ubxty/azure-ai
 ```
 
-This pulls `ubxty/core-ai ^2.1` transitively. The service provider is auto-discovered.
+This pulls `ubxty/core-ai ^2.1.3` transitively. The service provider is auto-discovered.
 
 The package needs PHP 8.2+, Laravel 11 or 12, and an Azure subscription with at least one OpenAI model deployment. See [`docs/getting-started.md`](docs/getting-started.md) for the full setup including portal walkthrough and `azure:configure` wizard.
 
@@ -116,9 +116,9 @@ The full top-level layout:
         'base_delay'  => 2,                       // seconds, doubles each retry (capped by Retry-After)
     ],
     'cache' => [
-        'models_ttl' => 3600,                     // Deploment catalogue cache (seconds)
-        'response_ttl' => 0,                      // Inherited from core-ai.cache.response_ttl; memoised invoke/converse
-        'embedding_ttl' => 604800,                // Inherited from core-ai.cache.embedding_ttl; 7 days
+        'models_ttl' => 3600,                     // Deployment catalogue cache (seconds)
+        'response_ttl' => 0,                      // Memoised invoke/converse; reads core-ai.azure_ai.cache.response_ttl first, then core-ai.cache.response_ttl
+        'embedding_ttl' => 604800,                // Embedding TTL (7 days); reads core-ai.azure_ai.cache.embedding_ttl first, then core-ai.cache.embedding_ttl
     ],
     'limits' => [
         'daily'   => null,                        // Hard cap in USD/day.  null disables.
@@ -291,7 +291,7 @@ $result = Azure::converse(
 Streaming:
 
 ```php
-return Azure::stream(
+return Azure::converseStream(
     modelId: 'gpt-4o',
     messages: [['role' => 'user', 'content' => 'Tell me a story.']],
     onChunk: function (string $chunk) {
@@ -301,7 +301,7 @@ return Azure::stream(
 );
 ```
 
-Or for SSE-backed streaming responses:
+For SSE-backed streaming responses:
 
 ```php
 return Azure::converseStream(
@@ -338,12 +338,9 @@ class FooService
 | `invoke($modelId, $systemPrompt, $userMessage, $maxTokens = 4096, $temperature = 0.7, $pricing = null, $connection = null): array` | `['response', 'input_tokens', 'output_tokens', 'total_tokens', 'cost', 'latency_ms', 'status', 'key_used', 'model_id']` | Single-turn call. v2.1.0+ attaches deterministic Idempotency-Key. |
 | `converse($modelId, $messages, $systemPrompt = '', $maxTokens = 4096, $temperature = 0.7, $connection = null): array` | Same shape | Multi-turn call. |
 | `converseStream($modelId, $messages, callable $onChunk, $systemPrompt = '', $maxTokens = 4096, $temperature = 0.7, $connection = null): array` | Same shape | SSE streaming; chunks yielded via callback. |
-| `stream($modelId, $messages, callable $onChunk, …): array` | Same shape | Convenience alias for `converseStream`. |
-| `conversation(?string $modelId = null)` | `ConversationBuilder` | Fluent multi-turn builder (mirror of `prism-php`). |
-| `embed($deploymentId, array $texts, ?int $dimensions = null, ?string $user = null, ?string $connection = null): array` | `array<int, float[]>` (NEW v2.1.0) | Batch embedding. Cached per-text for `core-ai.cache.embedding_ttl`. |
+| `conversation(string $modelId)` | `ConversationBuilder` | Fluent multi-turn builder (mirror of `prism-php`). |
+| `embed($deploymentId, array $texts, ?int $dimensions = null, ?string $user = null, ?string $connection = null): array` | `array<int, float[]>` (NEW v2.1.0) | Batch embedding. Cached per-text for `core-ai.azure_ai.cache.embedding_ttl` (7 days; falls back to `core-ai.cache.embedding_ttl`). |
 | `client(?string $connection = null): AzureClient` | The underlying client | Useful for advanced introspection. |
-| `pricing()` (inherited from `AbstractAiManager`) | `PricingService` | Live pricing model from `PricingService` — see below. |
-| `usage()` (inherited) | `UsageTracker` | Per-model invocation count from CloudWatch or local counter. |
 | `isConfigured(?string $connection = null): bool` | bool | True when the connection has at least one key with both `api_key` and `endpoint`. |
 | `supportsStreaming(?string $connection = null): bool` | bool | Always true (Azure OpenAI supports streaming across both flavours). |
 | `getCredentialInfo(?string $connection = null): array` | array | Label + endpoint + configured per key (no secrets). |
@@ -351,16 +348,19 @@ class FooService
 | `fetchModels(?string $connection = null): array` | Normalised `[…]` | Live data + inferred specs. Falls back to default model if listing returns empty. |
 | `getModelsGrouped(?string $connection = null)` | by-provider | Catalogue from config + live fetch fallback. |
 | `syncModels(?string $connection = null): int` | Count | No-op since 1.1.0 — returns configured-model count. |
-| `testConnection(?string $connection = null): array` | `['success', 'message', 'response_time', 'model_count']` | Health check; performs a minimal chat call on Foundry. |
+| `testConnection(?string $connection = null): array` | `['success', 'message', 'response_time', 'deployment_count']` (traditional) / `['success', 'message', 'response_time', 'model_count']` (Foundry v1) | Health check; performs a minimal chat call on Foundry. |
 | `platformName(): string` | `'Azure OpenAI'` | For event payloads. |
 
 Useful inherited helpers from core-ai (see `ubxty/core-ai` docs for full list):
 
-- `idempotencyKey($modelId, $content)` — builds the `sha256(modelId|content)` idempotency key.
-- `estimateTokens($text)` / `estimateMultimodal($blocks)` — pre-call token counters.
-- `getModelsConfigured(?string $connection = null)` — read the config `models` block, normalised.
-- `checkCostLimits($modelId, $pricing)` — invoke guard; throws `CostLimitExceededException` if `limits.daily` or `limits.monthly` would be breached.
-- `trackCost($cost)` — increment the spend ledger (uses an atomic lock to avoid races).
+- `idempotencyKey($modelId, $content)` — returns `azure_openai_ai-<sha256(modelId|content)>`. The Azure cache/key prefix is derived from `cachePrefix()` (which is `strtolower(str_replace(' ', '_', platformName())) . '_ai'`).
+- `TokenEstimator::estimate($text)` / `TokenEstimator::estimateMultimodal($messages, $systemPrompt)` — static pre-call token counters in `Ubxty\CoreAi\Support\TokenEstimator`.
+
+> **Note:** the following helpers exist on `AbstractAiManager` but are `protected` — not callable from app code:
+>
+> - `getConfiguredModels(?string $connection = null)` — read the config `models` block, normalised.
+> - `checkCostLimits($modelId, $pricing)` — invoke guard; throws `CostLimitExceededException` if `limits.daily` or `limits.monthly` would be breached.
+> - `trackCost($cost)` — increment the spend ledger (uses an atomic lock to avoid races).
 
 ---
 
@@ -407,7 +407,7 @@ $response = Azure::converse(
 );
 ```
 
-Note: passing `systemPrompt` adds a top-level system message *and* allows the messages array to contain its own system entry. The explicit `systemPrompt` overrides any system message in the array — the array's system entry is dropped.
+Note: `formatMessages()` always prepends the explicit `systemPrompt` first, then iterates the messages array verbatim — system entries from the array are NOT dropped; both are sent to the provider.
 
 ### `converseStream()`
 
@@ -450,22 +450,26 @@ return Azure::conversation('gpt-4o')
     ->send();
 ```
 
-Built-in fluent methods (inherited from `Ubxty\CoreAi\Conversation\ConversationBuilder`):
+Built-in fluent methods (inherited from `Ubxty\CoreAi\Conversation\ConversationBuilder` — `model()`, `history()`, `schema()`, `userWithDocuments()`, `userWithAttachments()`, `image()`, `stream()`, and `getSchema()` require `ubxty/core-ai ^2.1.3`):
 
 | Method | Purpose |
 |---|---|
-| `model(string $id)` | Set the deployment / model ID mid-build. |
+| `model(string $id)` | Set the deployment / model ID mid-build. (core-ai ^2.1.3) |
 | `system(string $prompt)` | Add the system prompt. |
 | `user(string $content)` | Append a user turn. |
 | `assistant(string $content)` | Append an assistant turn (for replay/seed). |
 | `userWithImage(string $content, $image)` | Multimodal image turn. Accepts file path or pre-encoded base64. |
-| `userWithDocument(string $content, $doc)` | Document turn (text-only on Azure — extracts text). |
-| `history(array $messages)` | Re-seed messages from a saved conversation. |
+| `userWithDocuments(string $content, array $documents)` | Append a user message with multiple documents (text only on Azure — extracts text content). (core-ai ^2.1.3) |
+| `userWithAttachments(string $content, array $attachments)` | Mixed image + document attachments in a single message. (core-ai ^2.1.3) |
+| `image(string $source, string $prompt = '')` | Single-image shorthand for `userWithImage()`. (core-ai ^2.1.3) |
+| `history(array $messages)` | Re-seed messages from a saved conversation (appends rather than replaces). (core-ai ^2.1.3) |
 | `temperature(float $t)` | Set temperature. |
 | `maxTokens(int $n)` | Set max output tokens. |
-| `schema(array $jsonSchema)` | Constrain output to a JSON schema (model-dependent). |
+| `schema(array $jsonSchema)` | Append the JSON Schema as a system-prompt instruction (advisory, model-dependent — newer Claude / GPT-4o+ / Nova follow it reliably). (core-ai ^2.1.3) |
 | `send(): array` | Run synchronously; returns the standard result shape. |
 | `sendStream(callable $onChunk): array` | Run streaming; chunks delivered via callback. |
+| `stream(callable $onChunk): array` | Alias for `sendStream()`. (core-ai ^2.1.3) |
+| `getSchema(): ?array` | Return the schema set via `schema()`, or `null`. (core-ai ^2.1.3) |
 | `estimate(): array` | Pre-call token + cost estimate. |
 | `reset()` | Clear all turns. |
 
@@ -497,37 +501,34 @@ Every lever in `ubxty/core-ai` is available to `ubxty/azure-ai`. Some Azure-spec
 | Lever | How it works on Azure |
 |---|---|
 | **Prompt caching** | `cache_control: { type: 'ephemeral' }` injected into chat bodies at `system` and `last_user` anchors. |
-| **Response cache** | SHA256-keyed `(model, sys, user, max, temp)` memo. Shared with bedrock-ai. |
-| **Embedding cache** | SHA256-keyed `(deployment, dimensions, text)` memo. 7-day default. |
-| **Idempotency-Key** | `Idempotency-Key: <sha256>` header. Network-blip retries deduplicated server-side. |
+| **Response cache** | SHA256-keyed `(model, sys, user, max, temp)` memo. Per-platform — Azure cache key is `azure_openai_ai_response_<sha256>`; `bedrock-ai` uses its own `aws_bedrock_ai_response_<sha256>`. |
+| **Embedding cache** | SHA256-keyed `(deployment, dimensions, text)` memo (`azure_ai_embeddings_<sha256>`). 7-day default. |
+| **Idempotency-Key** | `Idempotency-Key: <sha256>` header. Auto-attached only on `invoke()`; `converse()` / `converseStream()` don't derive one unless the caller passes `?string $idempotencyKey` to `AzureClient::converse()` directly. Network-blip retries deduplicated server-side. |
 | **Retry-After** | Header honoured before exponential backoff. |
-| **Token clamp + fits gate** | Inherited from `core-ai.ModelSpecResolver` + `TokenEstimator::estimateMultimodal`. |
+| **Token clamp + fits gate** | Inherited from `core-ai.ModelSpecResolver` + `TokenEstimator::estimate()` (for `invoke()`) / `TokenEstimator::estimateMultimodal()` (for `converse()`). |
 | **Multi-key failover** | Round-robin keys[] with rotation on 429 / 401. |
 
 See [`docs/caching-strategy.md`](docs/caching-strategy.md) for full reference with cost math.
 
 ### Config
 
+The TTL keys live under `azure_ai.*`, not at the top-level `core-ai.cache.*`. Set them in `config/core-ai.php`:
+
 ```php
+// config/core-ai.php
 'azure_ai' => [
     'prompt_caching' => [
-        'points' => ['system', 'last_user'], // both anchors
+        'points' => ['system', 'last_user'],
     ],
-    // …
-],
-'cache' => [
-    'response_ttl'   => 0,        // 0 = disabled; set to e.g. 3600 for memo
-    'embedding_ttl'  => 604800,   // 7 days
+    'cache' => [
+        'response_ttl'  => 0,        // 0 = disabled; set to e.g. 3600 for memo
+        'embedding_ttl' => 604800,   // 7 days
+    ],
+    // ...
 ],
 ```
 
-Or via env:
-
-```dotenv
-AZURE_OPENAI_PROMPT_CACHE_POINTS=system,last_user
-AZURE_OPENAI_RESPONSE_CACHE_TTL=0
-AZURE_OPENAI_EMBEDDING_CACHE_TTL=604800
-```
+The package does NOT bridge `AZURE_OPENAI_PROMPT_CACHE_POINTS`, `AZURE_OPENAI_RESPONSE_CACHE_TTL`, or `AZURE_OPENAI_EMBEDDING_CACHE_TTL` (no `env(...)` in the published config) — set the keys above directly. Publish with `php artisan vendor:publish --tag=core-ai-config` only if you want to customise.
 
 ### Cost math (typical)
 
@@ -589,7 +590,7 @@ The detection lives in `AzureManager::isV1EndpointForEmbed()` — same heuristic
 
 ### Cache
 
-Per-row SHA256: `azure_ai_embeddings_{sha256(deployment|dimensions|text)}`. TTL: `core-ai.cache.embedding_ttl` (default 7 days). See [`docs/embeddings.md`](docs/embeddings.md) for batch sizing, invalidation, and integration with vector stores (pgvector, Pinecone, etc.).
+Per-row SHA256: `azure_ai_embeddings_{sha256(deployment|dimensions|text)}`. TTL: `core-ai.azure_ai.cache.embedding_ttl` first (falls back to `core-ai.cache.embedding_ttl`, default 7 days). See [`docs/embeddings.md`](docs/embeddings.md) for batch sizing, invalidation, and integration with vector stores (pgvector, Pinecone, etc.).
 
 ---
 
@@ -631,9 +632,7 @@ Filter by Azure's group name (use `az resource list --resource-type Microsoft.Co
 | `azure:chat` | Multi-turn streaming chat in the terminal. |
 | `azure:test` | Smoke-test invocation with a chosen deployment. |
 | `azure:models` | Browse deployments (config-driven + live fallback). |
-| `azure:default-model [--show] [--reset] [--connection=…]` | Set or inspect the default chat / image deployment in `.env`. |
-| `azure:pricing` | Live pricing per token from `PricingService`. |
-| `azure:usage [--days=N] [--model=…]` | CloudWatch usage for the model, last N days. |
+| `azure:default-model {model?} {--connection=…}` | Set or inspect the default chat / image deployment in `.env`. |
 
 ---
 
@@ -687,7 +686,7 @@ All four extend `Ubxty\CoreAi\Exceptions\AiException`, which extends `\RuntimeEx
 ],
 ```
 
-Returns `200 { success: true, model_count: 7 }` on success, `503 { success: false, message: "…" }` on failure. For Foundry v1 endpoints the check performs a minimal `chat/completions` POST instead of `listDeployments()` (which isn't exposed).
+Returns `200 { "status": "ok", "platform": "Azure OpenAI", "message": "…", "response_time_ms": 1234 }` on success, `503 { "status": "error", "platform": "Azure OpenAI", "message": "…", "response_time_ms": 5678 }` on failure. For Foundry v1 endpoints the check performs a minimal `chat/completions` POST instead of `listDeployments()` (which isn't exposed).
 
 ---
 

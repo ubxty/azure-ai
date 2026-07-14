@@ -21,7 +21,7 @@ The minimum RBAC role is `Cognitive Services OpenAI User` (or higher). It grants
 composer require ubxty/azure-ai
 ```
 
-Auto-pulled: `ubxty/core-ai ^2.1`. Service provider is auto-discovered.
+Auto-pulled: `ubxty/core-ai ^2.1.3`. Service provider is auto-discovered.
 
 ---
 
@@ -155,7 +155,7 @@ $result = Azure::converse(
 ## 9. Streaming
 
 ```php
-return Azure::stream(
+return Azure::converseStream(
     modelId: 'gpt-4o',
     messages: [['role' => 'user', 'content' => 'Tell me a story.']],
     onChunk: fn (string $chunk) => echo $chunk,

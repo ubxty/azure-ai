@@ -84,7 +84,7 @@ For the request body:
 
 ## Caching
 
-Per-row memoisations under `core-ai.cache.embedding_ttl` (default 7 days):
+Per-row memoisations under `core-ai.azure_ai.cache.embedding_ttl` (falls back to `core-ai.cache.embedding_ttl`, default 7 days):
 
 | Field | Description |
 |---|---|
@@ -97,8 +97,12 @@ Cache hit = zero Azure spend. Cache miss = one Azure OpenAI embedding HTTP call.
 ### Extend the TTL
 
 ```php
-'cache' => [
-    'embedding_ttl' => 30 * 86400, // 30 days
+// config/core-ai.php
+'azure_ai' => [
+    'cache' => [
+        'embedding_ttl' => 30 * 86400, // 30 days
+    ],
+    // ...
 ],
 ```
 

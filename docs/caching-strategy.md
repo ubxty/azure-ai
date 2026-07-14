@@ -10,8 +10,8 @@
 |---|---|---|---|
 | Deployment listing | `core-ai.azure_ai.cache.models_ttl` | 3600 s | `azure_ai_deployments_{md5(base+key)}` |
 | Model catalogue | `core-ai.azure_ai.cache.models_ttl` | 3600 s | `azure_ai_models_{md5(base+key)}` |
-| Response cache (v2.1.0+) | `core-ai.cache.response_ttl` | 0 (off) | `azure_ai_response_{sha256(...)}` |
-| Embedding cache (v2.1.0+) | `core-ai.cache.embedding_ttl` | 604800 s (7 d) | `azure_ai_embeddings_{sha256(...)}` |
+| Response cache (v2.1.0+) | `core-ai.azure_ai.cache.response_ttl` (falls back to `core-ai.cache.response_ttl`) | 0 (off) | `azure_openai_ai_response_{sha256(...)}` (built from `cachePrefix()` = `azure_openai_ai`) |
+| Embedding cache (v2.1.0+) | `core-ai.azure_ai.cache.embedding_ttl` (falls back to `core-ai.cache.embedding_ttl`) | 604800 s (7 d) | `azure_ai_embeddings_{sha256(...)}` |
 | Prompt-cache markers (v2.1.0+) | `core-ai.azure_ai.prompt_caching.points` | upstream-controlled (typically 5-30 min) | injected into chat body |
 | Daily / monthly spend ledger | (not a memo — atomic increments under `Cache::lock()`) | persistent | tracks spend |
 
@@ -54,6 +54,8 @@ AZURE_OPENAI_PROMPT_CACHE_POINTS=system,last_user
 
 Empty `points` disables.
 
+> `AZURE_OPENAI_PROMPT_CACHE_POINTS` is **not bridged** by the published `config/core-ai.php`. Set `'points' => ['system', 'last_user']` directly in `config/core-ai.php` under `azure_ai.prompt_caching.*`.
+
 ### Caveat: string content
 
 If the system message has plain-string `content` (not a parts array), the client converts it into a single `[{ type: 'text', text: '…' }]` parts array and attaches `cache_control` to that one part. This is invisible to the caller.
@@ -75,7 +77,7 @@ A `gpt-4o` call with a 600-token static system prompt + 100-token user message +
 
 ---
 
-## 2. Response cache (`core-ai.cache.response_ttl`)
+## 2. Response cache (`core-ai.azure_ai.cache.response_ttl`)
 
 `invoke()` / `converse()` memoise results in Laravel's default cache store. The SHA256 hash covers `(model, sys, user, max, temp)`. Bypass the cache by varying any of those.
 
@@ -94,16 +96,16 @@ A `gpt-4o` call with a 600-token static system prompt + 100-token user message +
 ### Configuration
 
 ```php
-'cache' => [
-    'response_ttl' => 3600, // 1 hour
+// config/core-ai.php
+'azure_ai' => [
+    'cache' => [
+        'response_ttl' => 3600, // 1 hour
+    ],
+    // ...
 ],
 ```
 
-Or:
-
-```dotenv
-AZURE_OPENAI_RESPONSE_CACHE_TTL=3600
-```
+> `cache.response_ttl` is **not defined in the published config by default** — you must publish `core-ai-config` and add the key under `azure_ai.cache.response_ttl` (which reads via `$this->config['cache']['response_ttl']` in the manager). The env var `AZURE_OPENAI_RESPONSE_CACHE_TTL` is **not bridged**; set the config key directly.
 
 ### Bypass cache for one call
 
@@ -121,7 +123,7 @@ Azure::invoke('gpt-4o', '…', $userMessage, temperature: 0.2000001);
 
 ---
 
-## 3. Embedding cache (`core-ai.cache.embedding_ttl`)
+## 3. Embedding cache (`core-ai.azure_ai.cache.embedding_ttl`)
 
 `AzureManager::embed()` memoise per-text vectors:
 
@@ -129,13 +131,17 @@ Azure::invoke('gpt-4o', '…', $userMessage, temperature: 0.2000001);
 $vectors = $manager->embed('text-embedding-3-small', $corpus, dimensions: 512);
 ```
 
-Cache key: `sha256(deploymentId|dimensions|text)`. Changing any of those resets. TTL: 7 days default.
+Cache key: `azure_ai_embeddings_{sha256(deploymentId|dimensions|text)}`. Changing any of those resets. TTL: 7 days default (`core-ai.azure_ai.cache.embedding_ttl`, falls back to `core-ai.cache.embedding_ttl`).
 
 ### When to extend
 
 ```php
-'cache' => [
-    'embedding_ttl' => 30 * 86400, // 30 days
+// config/core-ai.php
+'azure_ai' => [
+    'cache' => [
+        'embedding_ttl' => 30 * 86400, // 30 days
+    ],
+    // ...
 ],
 ```
 
@@ -164,8 +170,10 @@ Azure OpenAI uses the header to deduplicate retries. A network-blip retry return
 
 ```php
 $key = app(AzureManager::class)->idempotencyKey($modelId, $systemPrompt . $userMessage);
-// 'azure_ai-<sha256 hash>'
+// 'azure_openai_ai-<sha256 hash>'  (prefix = cachePrefix() = azure_openai_ai)
 ```
+
+Note: this is the **prefixed key** returned by `idempotencyKey()` for app-level tracing. The `Idempotency-Key` HTTP header attached inside `performInvoke()` is a *different* hash: `sha256(model|system|user)` (no prefix).
 
 Use it when storing invocation metadata so retries can be traced by key.
 

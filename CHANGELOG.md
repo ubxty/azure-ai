@@ -6,6 +6,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and 
 
 ---
 
+## [2.1.2] - 2026-07-14
+
+### Documentation
+- README.md L635-636: removed artisan-command rows for `azure:pricing` and `azure:usage` (no such commands shipped).
+- README.md L294, L341, getting-started.md L158: `Azure::stream(...)` (fictional) → `Azure::converseStream(...)`.
+- README.md L634: `azure:default-model [--show] [--reset] [--connection=...]` → `azure:default-model {model?} {--connection=}`.
+- README.md L690: health-check response shape `{success, model_count}` → `{status, platform, message, response_time_ms}`.
+- README.md L457-470: kept `conversation()` rows for `model()` / `history()` / `schema()` (these now exist on `ConversationBuilder` per core-ai v2.1.3) and noted the `^2.1.3` requirement.
+- README.md L527-530: env-var references `AZURE_OPENAI_PROMPT_CACHE_POINTS` etc. → direct config keys under `core-ai.azure_ai.*`. Published config does NOT bridge those env names; set them in `config/core-ai.php` under the `azure_ai` block.
+- README.md L404-410: `systemPrompt` "overrides" claim was inverted — actual behaviour is to prepend explicit system prompt AND keep any system messages in the array.
+- README.md L502: response-cache "Shared with bedrock-ai" claim dropped — cache keys are platform-prefixed and don't collide.
+- README.md L120-121: misleading "Inherited from core-ai.cache.*" comment replaced with explicit `core-ai.azure_ai.cache.*` lookup.
+- README.md L345-346: removed fictional `pricing()` and `usage()` methods on the manager (Azure has no AWS-style PricingService / UsageTracker).
+- README.md L361-363: helper methods marked `protected` — not callable from app code.
+- README.md L360: `estimateTokens($text)` → `TokenEstimator::estimate($text)` (static).
+- README.md L119: typo `Deploment` → `Deployment`.
+- README.md L354: `testConnection` returns `deployment_count` for traditional endpoints, `model_count` only for Foundry v1.
+- docs/getting-started.md L158: `Azure::stream(...)` → `Azure::converseStream(...)`.
+- docs/real-world-patterns.md L260-272: removed `$event->idempotencyKey` (doesn't exist).
+- docs/real-world-patterns.md L291-295: `$event->retryAfterSeconds` → `$event->waitSeconds`.
+- docs/real-world-patterns.md: kept `->schema(...)` chained usage (now valid via core-ai v2.1.3 — appends JSON-Schema instruction to system prompt).
+- docs/caching-strategy.md L13, L165-168: cache prefix `azure_ai` → `azure_openai_ai`.
+- docs/caching-strategy.md L52-53: env-var reference dropped (config key only).
+- docs/caching-strategy.md L98-100: noted `cache.response_ttl` is not in the published config by default.
+- docs/faq.md L41: `config(['core-ai.cache.response_ttl' => 0])` → `config(['core-ai.azure_ai.cache.response_ttl' => 0])`.
+- docs/faq.md: cache-prefix mentions in examples updated to `azure_openai_ai-`.
+
+### Notes
+- composer dependency bumped: `ubxty/core-ai ^2.1` → `^2.1.3`.
+- No PHP source changes in this release — pure doc correction roll.
+
+---
+
 ## [2.1.1] - 2026-07-13
 
 ### Documentation

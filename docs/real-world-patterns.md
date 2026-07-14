@@ -87,7 +87,7 @@ $result = Azure::conversation('gpt-4o')
     ->send();
 ```
 
-`gpt-4o`, `gpt-4-turbo`, and `gpt-4o-mini` all support JSON-schema constrained output.
+`gpt-4o`, `gpt-4-turbo`, and `gpt-4o-mini` all support JSON-schema constrained output. (`schema()` appends the schema to the system prompt as an instruction — model capability differs; for `core-ai >= 2.1.3`.)
 
 ---
 
@@ -144,7 +144,7 @@ $base = $system;
 $samples = ['v1', 'v2', 'v3', 'v4'];
 
 foreach ($samples as $variant) {
-    config(['core-ai.cache.response_ttl' => 0]); // bypass cache
+    config(['core-ai.azure_ai.cache.response_ttl' => 0]); // bypass cache
     $out = Azure::invoke('gpt-4o', $base, $variant);
     Storage::append("experiments/p1.log", "[$variant] {$out['response']}\n");
 }
@@ -252,6 +252,8 @@ $result = Azure::conversation('gpt-4o')
 $decoded = json_decode($result['response'], true);
 ```
 
+`schema()` is supported on `ConversationBuilder` from `ubxty/core-ai ^2.1.3` (appends the schema to the system prompt as an instruction).
+
 ---
 
 ## 10. Audit log via `AzureInvoked`
@@ -266,7 +268,9 @@ Event::listen(AzureInvoked::class, function ($e) {
         'tokens_out'  => $e->outputTokens,
         'key_used'    => $e->keyUsed,
         'latency_ms'  => $e->latencyMs,
-        'idempotency' => $e->idempotencyKey,
+        // AiInvoked payload does NOT carry an idempotencyKey property —
+        // derive one with app(AzureManager::class)->idempotencyKey($e->modelId, $sys . $user)
+        // when you need it for tracing.
     ]);
 });
 ```
@@ -289,9 +293,9 @@ If the same job runs twice in different workers, the underlying Azure call retur
 
 ```php
 Event::listen(AzureRateLimited::class, function ($e) {
-    $secs = $e->retryAfterSeconds ?? 30;
+    $secs = $e->waitSeconds ?? 30;
     Cache::put('ai.rate_limited_until', now()->addSeconds($secs));
-    Log::warning('rate limited', ['for' => $secs]);
+    Log::warning('rate limited', ['for' => $secs, 'attempt' => $e->retryAttempt]);
 });
 ```
 
