@@ -10,7 +10,7 @@
 |---|---|---|---|
 | Deployment listing | `core-ai.azure_ai.cache.models_ttl` | 3600 s | `azure_ai_deployments_{md5(base+key)}` |
 | Model catalogue | `core-ai.azure_ai.cache.models_ttl` | 3600 s | `azure_ai_models_{md5(base+key)}` |
-| Response cache (v2.1.0+) | `core-ai.azure_ai.cache.response_ttl` (falls back to `core-ai.cache.response_ttl`) | 0 (off) | `azure_openai_ai_response_{sha256(...)}` (built from `cachePrefix()` = `azure_openai_ai`) |
+| Response cache (v2.1.0+) | `core-ai.azure_ai.cache.response_ttl` (falls back to `core-ai.cache.response_ttl`) | 300 s (active by default since T1-PR1) | `azr:t<tenant>:c<conv>:response_{sha256(...)}` for the upstream-prefixed bucket; legacy `azure_openai_ai_response_{sha256(...)}` still produced by core-ai's `cachePrefix()` |
 | Embedding cache (v2.1.0+) | `core-ai.azure_ai.cache.embedding_ttl` (falls back to `core-ai.cache.embedding_ttl`) | 604800 s (7 d) | `azure_ai_embeddings_{sha256(...)}` |
 | Prompt-cache markers (v2.1.0+) | `core-ai.azure_ai.prompt_caching.points` | upstream-controlled (typically 5-30 min) | injected into chat body |
 | Daily / monthly spend ledger | (not a memo — atomic increments under `Cache::lock()`) | persistent | tracks spend |
@@ -79,19 +79,34 @@ A `gpt-4o` call with a 600-token static system prompt + 100-token user message +
 
 ## 2. Response cache (`core-ai.azure_ai.cache.response_ttl`)
 
-`invoke()` / `converse()` memoise results in Laravel's default cache store. The SHA256 hash covers `(model, sys, user, max, temp)`. Bypass the cache by varying any of those.
+`invoke()` / `converse()` memoise results in Laravel's default cache store. The SHA256 hash covers `(model, sys, user, max, temp)` and is namespace-prefixed by `azr:t<tenant>:c<conversation>:response:` (matches core-ai's `cacheNamespace()` shape so multi-tenant deployments can never collide). Bypass the cache by varying any of those.
 
-### When to enable
+The response cache is **active by default** since T1-PR1 (`CORE_AI_RESPONSE_TTL` default = 300 s). Override per-platform via `core-ai.azure_ai.cache.response_ttl` (falls back to `core-ai.cache.response_ttl`).
+
+### When to keep enabled (defaults are sensible)
 
 - Re-ingestion of structured data.
 - Templated replies (`"classify this ticket"`, `"summarise this case"`).
-- Anything temperature-stable that's idempotent and idempotent on the input.
+- Anything temperature-stable that's idempotent on the input.
 
 ### When NOT to enable
 
 - Live chat with rolling history (cache miss every turn = wasted compute).
 - Calls with timestamps in the user prompt (every call misses).
 - Anything where you want freshness > 1 second (use the response cache only when determinism is OK).
+
+### Disable
+
+Set the TTL to `0`:
+
+```php
+// config/core-ai.php
+'azure_ai' => [
+    'cache' => [
+        'response_ttl' => 0, // disable response cache entirely
+    ],
+],
+```
 
 ### Configuration
 
@@ -149,22 +164,26 @@ Cache hit = zero Azure spend; cache miss = one embedding call. For a 100k-row co
 
 ---
 
-## 4. Idempotency-Key (v2.1.0+)
+## 4. Idempotency-Key (v2.1.0+, namespaced T1-PR5)
 
-`AzureManager::performInvoke()` derives:
+`AzureManager::performInvoke()` derives a tenant + conversation-scoped key via `buildIdempotencyKey()`:
 
 ```php
-$idempotencyKey = hash('sha256', $modelId.'|'.$systemPrompt.'|'.$userMessage);
+$raw   = $modelId . '|' . $systemPrompt . '|' . json_encode($messages);
+$base  = hash('sha256', $raw);
+$ctx   = CacheKeyContext::resolve();                 // tenant() + ambient conversation
+$ns    = sprintf('azr:t%d:c%s', $ctx->tenantId ?? 0, $ctx->conversationId ?? 0);
+$idempotencyKey = $ns . ':' . $base;                 // 'azr:t1:c42:<sha256>'
 ```
 
 This is passed through to `AzureClient::converse(?string $idempotencyKey = null)`, which adds it as the `Idempotency-Key` HTTP header:
 
 ```
 POST /openai/deployments/.../chat/completions
-Idempotency-Key: <sha256>
+Idempotency-Key: azr:t1:c42:<sha256>
 ```
 
-Azure OpenAI uses the header to deduplicate retries. A network-blip retry returns the same response instead of double-billing.
+Azure OpenAI uses the header to deduplicate retries. A network-blip retry returns the same response instead of double-billing. The `azr:t<id>:c<id>:` prefix prevents collisions across tenants or concurrent conversations that happen to share the same `(model, system, user)` triple — the upstream retry bucket can no longer return a stale reply from a *different* tenant's earlier call. When the multi-tenant helper is absent, both ids degrade to `0`, preserving the v2.1.x hash-only behaviour.
 
 ### Compute the same key in your code
 

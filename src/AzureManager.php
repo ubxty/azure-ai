@@ -11,6 +11,7 @@ use Ubxty\AzureAi\Exceptions\AzureException;
 use Ubxty\CoreAi\Exceptions\ConfigurationException;
 use Ubxty\CoreAi\Manager\AbstractAiManager;
 use Ubxty\CoreAi\Models\ModelSpecResolver;
+use Ubxty\CoreAi\Support\CacheKeyContext;
 
 class AzureManager extends AbstractAiManager
 {
@@ -73,7 +74,9 @@ class AzureManager extends AbstractAiManager
 
         // Deterministic Idempotency-Key over (modelId, system, user) so a network
         // blip retries as the same request rather than a fresh billing event (v2.1.0).
-        $idempotencyKey = hash('sha256', $modelId.'|'.$systemPrompt.'|'.$userMessage);
+        // Namespaced by tenant + conversation (T1-PR5) so the upstream retry bucket
+        // never collides across tenants or chats.
+        $idempotencyKey = $this->buildIdempotencyKey($modelId, $systemPrompt, [['role' => 'user', 'content' => $userMessage]]);
 
         $result = $this->client($connection)->converse(
             $modelId,
@@ -97,6 +100,46 @@ class AzureManager extends AbstractAiManager
             'key_used' => $result['key_used'],
             'model_id' => $result['model_id'],
         ];
+    }
+
+    /**
+     * Build the upstream `Idempotency-Key` header value for a chat call.
+     *
+     * Shapes:
+     *   <raw>     = sha256(modelId | systemPrompt | json_encode(messages))
+     *   <prefix>  = "azr"
+     *   <namespace> = sprintf('azr:t%d:c%s', tenantId ?? 0, conversationId ?? 0)
+     *   return    = "<namespace>:<raw>"
+     *
+     * The tenant/conversation context is resolved from the ambient
+     * {@see CacheKeyContext::resolve()} so upstream-side retry dedup keys
+     * never collide across tenants or chats. When the multi-tenant helper
+     * is absent, both fields degrade to 0 (the shared namespace).
+     *
+     * @param  array<int, array{role: string, content: string|array}>  $messages
+     */
+    protected function buildIdempotencyKey(
+        string $modelId,
+        string $systemPrompt,
+        array $messages,
+        ?CacheKeyContext $ctx = null,
+    ): string {
+        $raw = $modelId.'|'.$systemPrompt.'|'.json_encode(
+            $messages,
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+        );
+        $base = hash('sha256', $raw);
+        $ctxArg = $ctx ?? CacheKeyContext::resolve();
+
+        $prefix = 'azr';
+        $namespace = sprintf(
+            '%s:t%d:c%s',
+            $prefix,
+            $ctxArg->tenantId ?? 0,
+            $ctxArg->conversationId ?? 0,
+        );
+
+        return $namespace.':'.$base;
     }
 
     protected function performConverse(
