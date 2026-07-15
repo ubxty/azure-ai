@@ -219,10 +219,11 @@ class AzureClient
         string $systemPrompt = '',
         int $maxTokens = 4096,
         float $temperature = 0.7,
+        ?string $idempotencyKey = null,
     ): array {
         $startTime = microtime(true);
 
-        return $this->withRetry($deploymentId, function (string $resolvedId, array $key) use ($messages, $onChunk, $systemPrompt, $maxTokens, $temperature, $startTime) {
+        return $this->withRetry($deploymentId, function (string $resolvedId, array $key) use ($messages, $onChunk, $systemPrompt, $maxTokens, $temperature, $idempotencyKey, $startTime) {
             $endpoint = $key['endpoint'];
             $apiVersion = $key['api_version'] ?? '2024-10-21';
             $apiKey = $key['api_key'];
@@ -252,6 +253,13 @@ class AzureClient
             );
             $curlHeaders[] = 'Content-Type: application/json';
             $curlHeaders[] = 'Accept: text/event-stream';
+
+            // A6 — forward caller-supplied idempotency key so a network
+            // blip retries as the same request rather than a fresh billing
+            // event. Mirrors the converse() path.
+            if ($idempotencyKey !== null && $idempotencyKey !== '') {
+                $curlHeaders[] = "Idempotency-Key: {$idempotencyKey}";
+            }
 
             $ch = curl_init();
             curl_setopt_array($ch, [

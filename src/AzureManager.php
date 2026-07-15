@@ -75,7 +75,9 @@ class AzureManager extends AbstractAiManager
         // Deterministic Idempotency-Key over (modelId, system, user) so a network
         // blip retries as the same request rather than a fresh billing event (v2.1.0).
         // Namespaced by tenant + conversation (T1-PR5) so the upstream retry bucket
-        // never collides across tenants or chats.
+        // never collides across tenants or chats. We resolve the ambient context
+        // here (callers that have explicit ctx use the converseWithContext
+        // override below, which threads it through).
         $idempotencyKey = $this->buildIdempotencyKey($modelId, $systemPrompt, [['role' => 'user', 'content' => $userMessage]]);
 
         $result = $this->client($connection)->converse(
@@ -99,6 +101,208 @@ class AzureManager extends AbstractAiManager
             'status' => 'success',
             'key_used' => $result['key_used'],
             'model_id' => $result['model_id'],
+        ];
+    }
+
+    /**
+     * A6 — Cache-namespace-aware invoke override.
+     *
+     * Threads the caller-supplied `$ctx` into the upstream `Idempotency-Key`
+     * header so two distinct conversations on the same tenant can no longer
+     * collide in the upstream retry bucket.
+     */
+    public function invokeWithContext(
+        string $modelId = '',
+        string $systemPrompt = '',
+        string $userMessage = '',
+        int $maxTokens = 4096,
+        float $temperature = 0.7,
+        ?array $pricing = null,
+        ?string $connection = null,
+        ?CacheKeyContext $ctx = null
+    ): array {
+        // Run the parent pipeline (it handles cost cap, response cache,
+        // event firing, logger) but replace the platform call so we can
+        // pass the explicit `$ctx` into the idempotency-key derivation.
+        return $this->performInvokeWithContext(
+            $modelId, $systemPrompt, $userMessage, $maxTokens, $temperature, $pricing, $connection, $ctx
+        );
+    }
+
+    /**
+     * A6 — Cache-namespace-aware converse override.
+     *
+     * Without this override, `performConverse()` ignored idempotency entirely
+     * and called the client with no key at all (per the v2.0.x signature).
+     * With it, we derive a tenant+conversation-namespaced key and forward it
+     * to the client.
+     */
+    public function converseWithContext(
+        string $modelId,
+        array $messages,
+        string $systemPrompt = '',
+        int $maxTokens = 4096,
+        float $temperature = 0.7,
+        ?string $connection = null,
+        ?array $pricing = null,
+        ?CacheKeyContext $ctx = null
+    ): array {
+        return $this->performConverseWithContext(
+            $modelId, $messages, $systemPrompt, $maxTokens, $temperature, $connection, $pricing, $ctx
+        );
+    }
+
+    /**
+     * A6 — Cache-namespace-aware streaming converse override.
+     */
+    public function converseStreamWithContext(
+        string $modelId,
+        array $messages,
+        callable $onChunk,
+        string $systemPrompt = '',
+        int $maxTokens = 4096,
+        float $temperature = 0.7,
+        ?string $connection = null,
+        ?array $pricing = null,
+        ?CacheKeyContext $ctx = null
+    ): array {
+        return $this->performConverseStreamWithContext(
+            $modelId, $messages, $onChunk, $systemPrompt, $maxTokens, $temperature, $connection, $pricing, $ctx
+        );
+    }
+
+    /**
+     * A6 — Platform implementation of invokeWithContext(). Mirrors
+     * `performInvoke()` but threads the caller's `$ctx` into the
+     * `Idempotency-Key` derivation. Returns the standard
+     * AbstractAiManager result shape; the parent `invokeWithContext`
+     * wraps this in cost cap + response cache + event firing.
+     */
+    private function performInvokeWithContext(
+        string $modelId,
+        string $systemPrompt,
+        string $userMessage,
+        int $maxTokens,
+        float $temperature,
+        ?array $pricing,
+        ?string $connection,
+        ?CacheKeyContext $ctx,
+    ): array {
+        $startTime = microtime(true);
+
+        $idempotencyKey = $this->buildIdempotencyKey(
+            $modelId, $systemPrompt, [['role' => 'user', 'content' => $userMessage]], $ctx
+        );
+
+        $result = $this->client($connection)->converse(
+            $modelId,
+            [['role' => 'user', 'content' => $userMessage]],
+            $systemPrompt,
+            $maxTokens,
+            $temperature,
+            $idempotencyKey,
+        );
+
+        $cost = $this->calculateCost($result['input_tokens'], $result['output_tokens'], $pricing);
+
+        return [
+            'response' => $result['response'],
+            'input_tokens' => $result['input_tokens'],
+            'output_tokens' => $result['output_tokens'],
+            'total_tokens' => $result['total_tokens'],
+            'cost' => $cost,
+            'latency_ms' => $result['latency_ms'] ?? (int) ((microtime(true) - $startTime) * 1000),
+            'status' => 'success',
+            'key_used' => $result['key_used'],
+            'model_id' => $result['model_id'],
+        ];
+    }
+
+    /**
+     * A6 — Platform implementation of converseWithContext(). The
+     * no-context `performConverse()` did not pass an idempotency key
+     * to the client at all (v2.0.x signature); the WithContext
+     * variant now derives a tenant+conversation-namespaced key and
+     * forwards it.
+     */
+    private function performConverseWithContext(
+        string $modelId,
+        array $messages,
+        string $systemPrompt,
+        int $maxTokens,
+        float $temperature,
+        ?string $connection,
+        ?array $pricing,
+        ?CacheKeyContext $ctx,
+    ): array {
+        $startTime = microtime(true);
+
+        $idempotencyKey = $this->buildIdempotencyKey($modelId, $systemPrompt, $messages, $ctx);
+
+        $result = $this->client($connection)->converse(
+            $modelId,
+            $messages,
+            $systemPrompt,
+            $maxTokens,
+            $temperature,
+            $idempotencyKey,
+        );
+
+        $cost = $this->calculateCost($result['input_tokens'] ?? 0, $result['output_tokens'] ?? 0, $pricing);
+
+        return [
+            'response' => $result['response'] ?? '',
+            'input_tokens' => $result['input_tokens'] ?? 0,
+            'output_tokens' => $result['output_tokens'] ?? 0,
+            'total_tokens' => $result['total_tokens'] ?? 0,
+            'cost' => $cost,
+            'latency_ms' => $result['latency_ms'] ?? (int) ((microtime(true) - $startTime) * 1000),
+            'status' => 'success',
+            'key_used' => $result['key_used'] ?? 'unknown',
+            'model_id' => $result['model_id'] ?? $modelId,
+        ];
+    }
+
+    /**
+     * A6 — Platform implementation of converseStreamWithContext().
+     */
+    private function performConverseStreamWithContext(
+        string $modelId,
+        array $messages,
+        callable $onChunk,
+        string $systemPrompt,
+        int $maxTokens,
+        float $temperature,
+        ?string $connection,
+        ?array $pricing,
+        ?CacheKeyContext $ctx,
+    ): array {
+        $startTime = microtime(true);
+
+        $idempotencyKey = $this->buildIdempotencyKey($modelId, $systemPrompt, $messages, $ctx);
+
+        $result = $this->client($connection)->converseStream(
+            $modelId,
+            $messages,
+            $onChunk,
+            $systemPrompt,
+            $maxTokens,
+            $temperature,
+            $idempotencyKey,
+        );
+
+        $cost = $this->calculateCost($result['input_tokens'] ?? 0, $result['output_tokens'] ?? 0, $pricing);
+
+        return [
+            'response' => $result['response'] ?? '',
+            'input_tokens' => $result['input_tokens'] ?? 0,
+            'output_tokens' => $result['output_tokens'] ?? 0,
+            'total_tokens' => $result['total_tokens'] ?? 0,
+            'cost' => $cost,
+            'latency_ms' => $result['latency_ms'] ?? (int) ((microtime(true) - $startTime) * 1000),
+            'status' => 'success',
+            'key_used' => $result['key_used'] ?? 'unknown',
+            'model_id' => $result['model_id'] ?? $modelId,
         ];
     }
 
@@ -394,7 +598,25 @@ class AzureManager extends AbstractAiManager
     ): array {
         $deploymentId = $this->resolveAlias($deploymentId);
         $modelName = $this->resolveModelName($deploymentId, $connection);
-        $tenantPrefix = $tenantId !== null ? "tenant:{$tenantId}:" : '';
+
+        // A12 — Default to the ambient tenant. If neither an explicit
+        // arg nor an ambient tenant is available (CLI / central domain
+        // / unit test), fall back to a `t0` namespace and emit a
+        // structured warning so operators can spot un-scoped embedding
+        // calls in production logs.
+        if ($tenantId === null) {
+            $ambient = function_exists('tenant') ? tenant('id') : null;
+            $tenantId = $ambient !== null ? (int) $ambient : 0;
+
+            if ($tenantId === 0 && function_exists('\\Illuminate\\Support\\Facades\\Log')) {
+                \Illuminate\Support\Facades\Log::warning('AzureManager::embed: no tenant_id resolved; falling back to shared t0 cache namespace', [
+                    'deployment_id' => $deploymentId,
+                    'model' => $modelName,
+                ]);
+            }
+        }
+
+        $tenantPrefix = $tenantId !== 0 ? "tenant:{$tenantId}:" : '';
 
         $ttl = (int) ($this->config['cache']['embedding_ttl']
             ?? config('core-ai.cache.embedding_ttl', 604800));
