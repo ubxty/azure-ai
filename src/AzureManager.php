@@ -327,11 +327,18 @@ class AzureManager extends AbstractAiManager
 
     /**
      * Generate embeddings for a batch of texts using the Azure OpenAI
-     * /embeddings endpoint. Cached per `(deploymentId, sha256(text))` for
-     * `core-ai.cache.embedding_ttl` seconds (default 7 days).
+     * /embeddings endpoint. Cached per `(modelName, dimensions, tenantId, sha256(text))`
+     * for `core-ai.cache.embedding_ttl` seconds (default 7 days).
+     *
+     * Cache key includes the resolved underlying model name (not just the
+     * deployment ID) so that two deployments pointing at different models —
+     * or the same deployment re-pointed at a different model — never share
+     * a stale vector. Tenant scoping via `?int $tenantId` namespaces the
+     * cache so multi-tenant deployments cannot collide.
      *
      * @param  string[]  $texts
      * @param  string  $user  Optional user-id header for abuse detection.
+     * @param  ?int  $tenantId  Optional tenant id to namespace the cache.
      * @return array<int, float[]>
      */
     public function embed(
@@ -340,8 +347,11 @@ class AzureManager extends AbstractAiManager
         ?int $dimensions = null,
         ?string $user = null,
         ?string $connection = null,
+        ?int $tenantId = null,
     ): array {
         $deploymentId = $this->resolveAlias($deploymentId);
+        $modelName = $this->resolveModelName($deploymentId, $connection);
+        $tenantPrefix = $tenantId !== null ? "tenant:{$tenantId}:" : '';
 
         $ttl = (int) ($this->config['cache']['embedding_ttl']
             ?? config('core-ai.cache.embedding_ttl', 604800));
@@ -360,8 +370,8 @@ class AzureManager extends AbstractAiManager
         $pending = [];
 
         foreach ($texts as $i => $text) {
-            $hash = hash('sha256', $deploymentId.'|'.((string) $dimensions).'|'.$text);
-            $cacheKey = "azure_ai_embeddings_{$hash}";
+            $hash = hash('sha256', $modelName.'|'.((string) $dimensions).'|'.$text);
+            $cacheKey = "azure_ai_embeddings_{$tenantPrefix}{$hash}";
             $cached = Cache::get($cacheKey);
             if (is_array($cached)) {
                 $results[$i] = $cached;
@@ -400,8 +410,8 @@ class AzureManager extends AbstractAiManager
                 throw new AzureException("Azure embed returned no vector for text index {$i}");
             }
 
-            $hash = hash('sha256', $deploymentId.'|'.((string) $dimensions).'|'.$text);
-            Cache::put("azure_ai_embeddings_{$hash}", $vec, $ttl);
+            $hash = hash('sha256', $modelName.'|'.((string) $dimensions).'|'.$text);
+            Cache::put("azure_ai_embeddings_{$tenantPrefix}{$hash}", $vec, $ttl);
             $results[$i] = $vec;
         }
 
@@ -416,5 +426,35 @@ class AzureManager extends AbstractAiManager
     private function isV1EndpointForEmbed(string $endpoint): bool
     {
         return str_ends_with($endpoint, '/v1') || str_contains($endpoint, '/v1/');
+    }
+
+    /**
+     * Resolve the underlying model name for a deployment ID.
+     *
+     * Used by embed() so the cache key is keyed by the actual model that
+     * produced the vectors (e.g. "text-embedding-3-small") rather than the
+     * arbitrary deployment ID the operator picked. Falls back to the
+     * deployment ID itself when the deployment listing is unavailable
+     * (AI Foundry project endpoints, transient API errors, etc.) so cache
+     * behaviour degrades gracefully to the v2.1.x shape.
+     */
+    private function resolveModelName(string $deploymentId, ?string $connection): string
+    {
+        try {
+            $models = $this->client($connection)->fetchModels();
+        } catch (\Throwable $e) {
+            return $deploymentId;
+        }
+
+        foreach ($models as $model) {
+            if (($model['model_id'] ?? null) === $deploymentId) {
+                $name = $model['name'] ?? null;
+                if (is_string($name) && $name !== '') {
+                    return $name;
+                }
+            }
+        }
+
+        return $deploymentId;
     }
 }
