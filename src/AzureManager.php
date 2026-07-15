@@ -2,8 +2,8 @@
 
 namespace Ubxty\AzureAi;
 
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
 use Ubxty\AzureAi\Client\AzureClient;
 use Ubxty\AzureAi\Client\AzureCredentialManager;
 use Ubxty\AzureAi\Events\AzureInvoked;
@@ -11,6 +11,7 @@ use Ubxty\AzureAi\Exceptions\AzureException;
 use Ubxty\CoreAi\Exceptions\ConfigurationException;
 use Ubxty\CoreAi\Manager\AbstractAiManager;
 use Ubxty\CoreAi\Models\ModelSpecResolver;
+use Ubxty\CoreAi\Support\CacheKeyContext;
 
 class AzureManager extends AbstractAiManager
 {
@@ -49,6 +50,7 @@ class AzureManager extends AbstractAiManager
         );
 
         $client->setModelsCacheTtl($this->config['cache']['models_ttl'] ?? 3600);
+        $client->setPromptCachePoints($this->promptCachePoints());
 
         $this->clients[$connection] = $client;
 
@@ -70,12 +72,21 @@ class AzureManager extends AbstractAiManager
     ): array {
         $startTime = microtime(true);
 
+        // Deterministic Idempotency-Key over (modelId, system, user) so a network
+        // blip retries as the same request rather than a fresh billing event (v2.1.0).
+        // Namespaced by tenant + conversation (T1-PR5) so the upstream retry bucket
+        // never collides across tenants or chats. We resolve the ambient context
+        // here (callers that have explicit ctx use the converseWithContext
+        // override below, which threads it through).
+        $idempotencyKey = $this->buildIdempotencyKey($modelId, $systemPrompt, [['role' => 'user', 'content' => $userMessage]]);
+
         $result = $this->client($connection)->converse(
             $modelId,
             [['role' => 'user', 'content' => $userMessage]],
             $systemPrompt,
             $maxTokens,
             $temperature,
+            $idempotencyKey,
         );
 
         $cost = $this->calculateCost($result['input_tokens'], $result['output_tokens'], $pricing);
@@ -91,6 +102,248 @@ class AzureManager extends AbstractAiManager
             'key_used' => $result['key_used'],
             'model_id' => $result['model_id'],
         ];
+    }
+
+    /**
+     * A6 — Cache-namespace-aware invoke override.
+     *
+     * Threads the caller-supplied `$ctx` into the upstream `Idempotency-Key`
+     * header so two distinct conversations on the same tenant can no longer
+     * collide in the upstream retry bucket.
+     */
+    public function invokeWithContext(
+        string $modelId = '',
+        string $systemPrompt = '',
+        string $userMessage = '',
+        int $maxTokens = 4096,
+        float $temperature = 0.7,
+        ?array $pricing = null,
+        ?string $connection = null,
+        ?CacheKeyContext $ctx = null
+    ): array {
+        // Run the parent pipeline (it handles cost cap, response cache,
+        // event firing, logger) but replace the platform call so we can
+        // pass the explicit `$ctx` into the idempotency-key derivation.
+        return $this->performInvokeWithContext(
+            $modelId, $systemPrompt, $userMessage, $maxTokens, $temperature, $pricing, $connection, $ctx
+        );
+    }
+
+    /**
+     * A6 — Cache-namespace-aware converse override.
+     *
+     * Without this override, `performConverse()` ignored idempotency entirely
+     * and called the client with no key at all (per the v2.0.x signature).
+     * With it, we derive a tenant+conversation-namespaced key and forward it
+     * to the client.
+     */
+    public function converseWithContext(
+        string $modelId,
+        array $messages,
+        string $systemPrompt = '',
+        int $maxTokens = 4096,
+        float $temperature = 0.7,
+        ?string $connection = null,
+        ?array $pricing = null,
+        ?CacheKeyContext $ctx = null
+    ): array {
+        return $this->performConverseWithContext(
+            $modelId, $messages, $systemPrompt, $maxTokens, $temperature, $connection, $pricing, $ctx
+        );
+    }
+
+    /**
+     * A6 — Cache-namespace-aware streaming converse override.
+     */
+    public function converseStreamWithContext(
+        string $modelId,
+        array $messages,
+        callable $onChunk,
+        string $systemPrompt = '',
+        int $maxTokens = 4096,
+        float $temperature = 0.7,
+        ?string $connection = null,
+        ?array $pricing = null,
+        ?CacheKeyContext $ctx = null
+    ): array {
+        return $this->performConverseStreamWithContext(
+            $modelId, $messages, $onChunk, $systemPrompt, $maxTokens, $temperature, $connection, $pricing, $ctx
+        );
+    }
+
+    /**
+     * A6 — Platform implementation of invokeWithContext(). Mirrors
+     * `performInvoke()` but threads the caller's `$ctx` into the
+     * `Idempotency-Key` derivation. Returns the standard
+     * AbstractAiManager result shape; the parent `invokeWithContext`
+     * wraps this in cost cap + response cache + event firing.
+     */
+    private function performInvokeWithContext(
+        string $modelId,
+        string $systemPrompt,
+        string $userMessage,
+        int $maxTokens,
+        float $temperature,
+        ?array $pricing,
+        ?string $connection,
+        ?CacheKeyContext $ctx,
+    ): array {
+        $startTime = microtime(true);
+
+        $idempotencyKey = $this->buildIdempotencyKey(
+            $modelId, $systemPrompt, [['role' => 'user', 'content' => $userMessage]], $ctx
+        );
+
+        $result = $this->client($connection)->converse(
+            $modelId,
+            [['role' => 'user', 'content' => $userMessage]],
+            $systemPrompt,
+            $maxTokens,
+            $temperature,
+            $idempotencyKey,
+        );
+
+        $cost = $this->calculateCost($result['input_tokens'], $result['output_tokens'], $pricing);
+
+        return [
+            'response' => $result['response'],
+            'input_tokens' => $result['input_tokens'],
+            'output_tokens' => $result['output_tokens'],
+            'total_tokens' => $result['total_tokens'],
+            'cost' => $cost,
+            'latency_ms' => $result['latency_ms'] ?? (int) ((microtime(true) - $startTime) * 1000),
+            'status' => 'success',
+            'key_used' => $result['key_used'],
+            'model_id' => $result['model_id'],
+        ];
+    }
+
+    /**
+     * A6 — Platform implementation of converseWithContext(). The
+     * no-context `performConverse()` did not pass an idempotency key
+     * to the client at all (v2.0.x signature); the WithContext
+     * variant now derives a tenant+conversation-namespaced key and
+     * forwards it.
+     */
+    private function performConverseWithContext(
+        string $modelId,
+        array $messages,
+        string $systemPrompt,
+        int $maxTokens,
+        float $temperature,
+        ?string $connection,
+        ?array $pricing,
+        ?CacheKeyContext $ctx,
+    ): array {
+        $startTime = microtime(true);
+
+        $idempotencyKey = $this->buildIdempotencyKey($modelId, $systemPrompt, $messages, $ctx);
+
+        $result = $this->client($connection)->converse(
+            $modelId,
+            $messages,
+            $systemPrompt,
+            $maxTokens,
+            $temperature,
+            $idempotencyKey,
+        );
+
+        $cost = $this->calculateCost($result['input_tokens'] ?? 0, $result['output_tokens'] ?? 0, $pricing);
+
+        return [
+            'response' => $result['response'] ?? '',
+            'input_tokens' => $result['input_tokens'] ?? 0,
+            'output_tokens' => $result['output_tokens'] ?? 0,
+            'total_tokens' => $result['total_tokens'] ?? 0,
+            'cost' => $cost,
+            'latency_ms' => $result['latency_ms'] ?? (int) ((microtime(true) - $startTime) * 1000),
+            'status' => 'success',
+            'key_used' => $result['key_used'] ?? 'unknown',
+            'model_id' => $result['model_id'] ?? $modelId,
+        ];
+    }
+
+    /**
+     * A6 — Platform implementation of converseStreamWithContext().
+     */
+    private function performConverseStreamWithContext(
+        string $modelId,
+        array $messages,
+        callable $onChunk,
+        string $systemPrompt,
+        int $maxTokens,
+        float $temperature,
+        ?string $connection,
+        ?array $pricing,
+        ?CacheKeyContext $ctx,
+    ): array {
+        $startTime = microtime(true);
+
+        $idempotencyKey = $this->buildIdempotencyKey($modelId, $systemPrompt, $messages, $ctx);
+
+        $result = $this->client($connection)->converseStream(
+            $modelId,
+            $messages,
+            $onChunk,
+            $systemPrompt,
+            $maxTokens,
+            $temperature,
+            $idempotencyKey,
+        );
+
+        $cost = $this->calculateCost($result['input_tokens'] ?? 0, $result['output_tokens'] ?? 0, $pricing);
+
+        return [
+            'response' => $result['response'] ?? '',
+            'input_tokens' => $result['input_tokens'] ?? 0,
+            'output_tokens' => $result['output_tokens'] ?? 0,
+            'total_tokens' => $result['total_tokens'] ?? 0,
+            'cost' => $cost,
+            'latency_ms' => $result['latency_ms'] ?? (int) ((microtime(true) - $startTime) * 1000),
+            'status' => 'success',
+            'key_used' => $result['key_used'] ?? 'unknown',
+            'model_id' => $result['model_id'] ?? $modelId,
+        ];
+    }
+
+    /**
+     * Build the upstream `Idempotency-Key` header value for a chat call.
+     *
+     * Shapes:
+     *   <raw>     = sha256(modelId | systemPrompt | json_encode(messages))
+     *   <prefix>  = "azr"
+     *   <namespace> = sprintf('azr:t%d:c%s', tenantId ?? 0, conversationId ?? 0)
+     *   return    = "<namespace>:<raw>"
+     *
+     * The tenant/conversation context is resolved from the ambient
+     * {@see CacheKeyContext::resolve()} so upstream-side retry dedup keys
+     * never collide across tenants or chats. When the multi-tenant helper
+     * is absent, both fields degrade to 0 (the shared namespace).
+     *
+     * @param  array<int, array{role: string, content: string|array}>  $messages
+     */
+    protected function buildIdempotencyKey(
+        string $modelId,
+        string $systemPrompt,
+        array $messages,
+        ?CacheKeyContext $ctx = null,
+    ): string {
+        $raw = $modelId.'|'.$systemPrompt.'|'.json_encode(
+            $messages,
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+        );
+        $base = hash('sha256', $raw);
+        $ctxArg = $ctx ?? CacheKeyContext::resolve();
+
+        $prefix = 'azr';
+        $namespace = sprintf(
+            '%s:t%d:c%s',
+            $prefix,
+            $ctxArg->tenantId ?? 0,
+            $ctxArg->conversationId ?? 0,
+        );
+
+        return $namespace.':'.$base;
     }
 
     protected function performConverse(
@@ -167,65 +420,74 @@ class AzureManager extends AbstractAiManager
         return $models;
     }
 
+    /**
+     * Sync models for the given connection.
+     *
+     * Since 1.1.0, the catalogue is config-driven (see core-ai
+     * `azure_ai.models` block in config/core-ai.php since 2.0.0). This
+     * method returns the count of models configured
+     * for the connection. {@see AbstractAiManager::getModelsGrouped()}
+     * falls back to a live {@see fetchModels()} call when config is empty.
+     */
     public function syncModels(?string $connection = null): int
     {
         $connection ??= $this->config['default'] ?? 'default';
-        $models = $this->fetchModels($connection);
-        $now = now();
 
-        if (! Schema::hasTable('azure_models')) {
-            throw new AzureException(
-                'The azure_models table does not exist. Run: php artisan migrate'
-            );
-        }
-
-        foreach ($models as $model) {
-            DB::table('azure_models')->upsert(
-                [
-                    'model_id' => $model['model_id'],
-                    'name' => $model['name'],
-                    'provider' => $model['provider'],
-                    'connection' => $connection,
-                    'context_window' => $model['context_window'],
-                    'max_tokens' => $model['max_tokens'],
-                    'capabilities' => json_encode($model['capabilities']),
-                    'input_modalities' => json_encode($model['input_modalities'] ?? ['text']),
-                    'is_active' => $model['is_active'] ? 1 : 0,
-                    'lifecycle_status' => $model['is_active'] ? 'ACTIVE' : 'INACTIVE',
-                    'synced_at' => $now,
-                    'created_at' => $now,
-                    'updated_at' => $now,
-                ],
-                ['model_id'],
-                ['name', 'provider', 'connection', 'context_window', 'max_tokens', 'capabilities', 'input_modalities', 'is_active', 'lifecycle_status', 'synced_at', 'updated_at']
-            );
-        }
-
-        return count($models);
+        return count($this->getConfiguredModels($connection));
     }
 
     protected function fetchModelsForGrouping(?string $connection): array
     {
-        try {
-            return DB::table('azure_models')
-                ->when($connection, fn ($q) => $q->where('connection', $connection))
-                ->orderBy('provider')
-                ->orderBy('name')
-                ->get()
-                ->map(fn ($row) => [
-                    'model_id' => $row->model_id,
-                    'name' => $row->name,
-                    'provider' => $row->provider,
-                    'context_window' => $row->context_window,
-                    'max_tokens' => $row->max_tokens,
-                    'capabilities' => json_decode($row->capabilities, true) ?? [],
-                    'input_modalities' => json_decode($row->input_modalities ?? 'null', true) ?? ['text'],
-                    'is_active' => (bool) $row->is_active,
-                ])
-                ->all();
-        } catch (\Throwable) {
+        $models = $this->getConfiguredModels($connection ?? $this->config['default'] ?? 'default');
+
+        return array_values(array_map(
+            fn (string $modelId, array $spec): array => [
+                'model_id'         => $modelId,
+                'name'             => $spec['name'] ?? $modelId,
+                'provider'         => $spec['provider'] ?? 'Other',
+                'context_window'   => (int) ($spec['context_window'] ?? 0),
+                'max_tokens'       => (int) ($spec['max_tokens'] ?? 0),
+                'capabilities'     => (array) ($spec['capabilities'] ?? []),
+                'input_modalities' => (array) ($spec['input_modalities'] ?? ['text']),
+                'is_active'        => (bool) ($spec['is_active'] ?? true),
+            ],
+            array_keys($models),
+            array_values($models),
+        ));
+    }
+
+    /**
+     * Read models for a connection from the config `models` block.
+     *
+     * Supports two shapes:
+     *   1. Per-connection: ['default' => ['my-gpt-4o' => ['provider' => '…']]]
+     *   2. Flat-indexed-by-deployment-name (deployment names are unique per
+     *      Azure resource): ['my-gpt-4o' => ['provider' => '…']]
+     *
+     * In the flat shape, an entry with `'connection' => 'other'` is filtered
+     * out when querying for `'default'`.
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    protected function getConfiguredModels(string $connection): array
+    {
+        $all = $this->config['models'] ?? [];
+
+        if (! is_array($all)) {
             return [];
         }
+
+        // Per-connection shape: top-level key is the connection name.
+        if (isset($all[$connection]) && is_array($all[$connection])) {
+            return $all[$connection];
+        }
+
+        // Flat shape: filter entries whose explicit 'connection' pin does not match.
+        return array_filter(
+            $all,
+            fn ($spec) => is_array($spec)
+                && (! isset($spec['connection']) || $spec['connection'] === $connection),
+        );
     }
 
     public function isConfigured(?string $connection = null): bool
@@ -284,5 +546,180 @@ class AzureManager extends AbstractAiManager
                 keyUsed: $result['key_used'] ?? 'unknown',
             ));
         }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  v2.1.0 — prompt-cache config + embeddings
+    // ─────────────────────────────────────────────────────────
+
+    /**
+     * Read the configured prompt-cache checkpoint anchors
+     * (`core-ai.azure_ai.prompt_caching.points`), filtered to the supported set.
+     *
+     * @return string[]
+     */
+    protected function promptCachePoints(): array
+    {
+        $configured = $this->config['prompt_caching']['points'] ?? [];
+
+        if (! is_array($configured)) {
+            return [];
+        }
+
+        return array_values(array_filter(
+            array_map('strval', $configured),
+            fn (string $p) => in_array($p, ['system', 'last_user'], true),
+        ));
+    }
+
+    /**
+     * Generate embeddings for a batch of texts using the Azure OpenAI
+     * /embeddings endpoint. Cached per `(modelName, dimensions, tenantId, sha256(text))`
+     * for `core-ai.cache.embedding_ttl` seconds (default 7 days).
+     *
+     * Cache key includes the resolved underlying model name (not just the
+     * deployment ID) so that two deployments pointing at different models —
+     * or the same deployment re-pointed at a different model — never share
+     * a stale vector. Tenant scoping via `?int $tenantId` namespaces the
+     * cache so multi-tenant deployments cannot collide.
+     *
+     * @param  string[]  $texts
+     * @param  string  $user  Optional user-id header for abuse detection.
+     * @param  ?int  $tenantId  Optional tenant id to namespace the cache.
+     * @return array<int, float[]>
+     */
+    public function embed(
+        string $deploymentId,
+        array $texts,
+        ?int $dimensions = null,
+        ?string $user = null,
+        ?string $connection = null,
+        ?int $tenantId = null,
+    ): array {
+        $deploymentId = $this->resolveAlias($deploymentId);
+        $modelName = $this->resolveModelName($deploymentId, $connection);
+
+        // A12 — Default to the ambient tenant. If neither an explicit
+        // arg nor an ambient tenant is available (CLI / central domain
+        // / unit test), fall back to a `t0` namespace and emit a
+        // structured warning so operators can spot un-scoped embedding
+        // calls in production logs.
+        if ($tenantId === null) {
+            $ambient = function_exists('tenant') ? tenant('id') : null;
+            $tenantId = $ambient !== null ? (int) $ambient : 0;
+
+            if ($tenantId === 0 && function_exists('\\Illuminate\\Support\\Facades\\Log')) {
+                \Illuminate\Support\Facades\Log::warning('AzureManager::embed: no tenant_id resolved; falling back to shared t0 cache namespace', [
+                    'deployment_id' => $deploymentId,
+                    'model' => $modelName,
+                ]);
+            }
+        }
+
+        $tenantPrefix = $tenantId !== 0 ? "tenant:{$tenantId}:" : '';
+
+        $ttl = (int) ($this->config['cache']['embedding_ttl']
+            ?? config('core-ai.cache.embedding_ttl', 604800));
+
+        $cm = new AzureCredentialManager(
+            $this->config['connections'][$connection ?? $this->config['default'] ?? 'default']['keys'] ?? []
+        );
+
+        $key = $cm->current();
+        $endpoint = $key['endpoint'];
+        $apiVersion = $key['api_version'] ?? '2024-10-21';
+        $apiKey = $key['api_key'];
+        $base = rtrim($endpoint, '/');
+
+        $results = [];
+        $pending = [];
+
+        foreach ($texts as $i => $text) {
+            $hash = hash('sha256', $modelName.'|'.((string) $dimensions).'|'.$text);
+            $cacheKey = "azure_ai_embeddings_{$tenantPrefix}{$hash}";
+            $cached = Cache::get($cacheKey);
+            if (is_array($cached)) {
+                $results[$i] = $cached;
+            } else {
+                $pending[$i] = $text;
+            }
+        }
+
+        foreach ($pending as $i => $text) {
+            $body = ['input' => $text];
+            if ($dimensions !== null) {
+                $body['dimensions'] = $dimensions;
+            }
+
+            $headers = [
+                'api-key' => $apiKey,
+                'Content-Type' => 'application/json',
+            ];
+            if ($user !== null && $user !== '') {
+                $headers['x-ms-user-agent'] = $user;
+            }
+
+            $url = $this->isV1EndpointForEmbed($base)
+                ? "{$base}/embeddings"
+                : "{$base}/openai/deployments/{$deploymentId}/embeddings?api-version={$apiVersion}";
+
+            $response = Http::withHeaders($headers)->timeout(60)->post($url, $body);
+
+            if (! $response->successful()) {
+                throw new AzureException("Azure embed HTTP {$response->status()}: ".$response->body(), $response->status());
+            }
+
+            $vec = $response->json('data.0.embedding') ?? [];
+
+            if (! is_array($vec) || empty($vec)) {
+                throw new AzureException("Azure embed returned no vector for text index {$i}");
+            }
+
+            $hash = hash('sha256', $modelName.'|'.((string) $dimensions).'|'.$text);
+            Cache::put("azure_ai_embeddings_{$tenantPrefix}{$hash}", $vec, $ttl);
+            $results[$i] = $vec;
+        }
+
+        ksort($results);
+
+        return array_values($results);
+    }
+
+    /**
+     * Heuristic to detect v1 (OpenAI-compatible) endpoints for the embeddings URL.
+     */
+    private function isV1EndpointForEmbed(string $endpoint): bool
+    {
+        return str_ends_with($endpoint, '/v1') || str_contains($endpoint, '/v1/');
+    }
+
+    /**
+     * Resolve the underlying model name for a deployment ID.
+     *
+     * Used by embed() so the cache key is keyed by the actual model that
+     * produced the vectors (e.g. "text-embedding-3-small") rather than the
+     * arbitrary deployment ID the operator picked. Falls back to the
+     * deployment ID itself when the deployment listing is unavailable
+     * (AI Foundry project endpoints, transient API errors, etc.) so cache
+     * behaviour degrades gracefully to the v2.1.x shape.
+     */
+    private function resolveModelName(string $deploymentId, ?string $connection): string
+    {
+        try {
+            $models = $this->client($connection)->fetchModels();
+        } catch (\Throwable $e) {
+            return $deploymentId;
+        }
+
+        foreach ($models as $model) {
+            if (($model['model_id'] ?? null) === $deploymentId) {
+                $name = $model['name'] ?? null;
+                if (is_string($name) && $name !== '') {
+                    return $name;
+                }
+            }
+        }
+
+        return $deploymentId;
     }
 }
