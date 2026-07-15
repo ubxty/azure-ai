@@ -28,4 +28,46 @@ class ChatCommand extends AbstractChatCommand
     {
         return 'Azure OpenAI';
     }
+
+    /**
+     * Azure OpenAI auto-caches for supported models — no client-side marker
+     * required and no opt-out. Surface a [cached-auto] badge in the picker so
+     * the user knows which deployments benefit from prompt caching.
+     *
+     * The list mirrors the documented Azure "automatic prompt caching" set
+     * (gpt-4o family, gpt-4-turbo, gpt-3.5-turbo, o1/o3-mini/o4-mini). The
+     * check is intentionally lenient — a deployment alias might be `my-gpt4o`
+     * while the underlying model name is hidden. We match the underlying model
+     * name if available, otherwise fall back to a simple "gpt-4o" substring.
+     */
+    protected function modelSupportsCaching(string $modelId): bool
+    {
+        $needle = strtolower($modelId);
+
+        $autoCacheHints = [
+            'gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo',
+            'o1', 'o1-mini', 'o1-preview',
+            'o3-mini', 'o4-mini',
+        ];
+
+        foreach ($autoCacheHints as $hint) {
+            if (str_contains($needle, $hint)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Distinct badge from Bedrock's [cached]: Azure caching is automatic, so
+     * the user can't toggle it. The auto- suffix tells them caching "just
+     * happens" if Azure decides the prefix is cache-eligible.
+     */
+    protected function cachingBadge(string $modelId): string
+    {
+        return $this->modelSupportsCaching($modelId)
+            ? ' <fg=magenta>[cached-auto]</>'
+            : '';
+    }
 }
