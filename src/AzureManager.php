@@ -373,6 +373,11 @@ class AzureManager extends AbstractAiManager
         return 'Azure OpenAI';
     }
 
+    protected function providerDefault(): string
+    {
+        return 'Azure OpenAI';
+    }
+
     /**
      * Fire an AzureInvoked event instead of the generic AiInvoked event.
      */
