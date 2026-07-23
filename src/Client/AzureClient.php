@@ -319,6 +319,24 @@ class AzureClient extends OpenAIClient
         return $this;
     }
 
+    /**
+     * Set the configured cachePoint message anchors.
+     *
+     * v2.2.3 parity shim — AzureManager::client() calls this after
+     * every client build. Parent OpenAIClient reads $promptCachePoints
+     * via the HasOpenAIFormatting trait, so the setter just needs to
+     * exist; Azure's converse path applies the anchors at request
+     * time. Matches the BedrockClient::setPromptCachePoints() shape.
+     *
+     * @param  string[]  $points
+     */
+    public function setPromptCachePoints(array $points): static
+    {
+        $this->promptCachePoints = array_values(array_map('strval', $points));
+
+        return $this;
+    }
+
     // ─────────────────────────────────────────────────────────
     //  Azure-specific error mapping (used by parent sendRequest)
     // ─────────────────────────────────────────────────────────
