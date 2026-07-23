@@ -56,7 +56,7 @@ The endpoint flavour determines the URL:
 | Traditional data-plane | `POST {base}/openai/deployments/{deploymentId}/embeddings?api-version={api_version}` |
 | Foundry v1 | `POST {base}/embeddings` |
 
-Detection lives in `AzureManager::isV1EndpointForEmbed()`:
+Detection lives in `AzureEndpointResolver::isV1()` (same heuristic as the chat path):
 
 ```php
 return str_ends_with($endpoint, '/v1') || str_contains($endpoint, '/v1/');

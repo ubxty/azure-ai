@@ -9,469 +9,138 @@ use Illuminate\Support\Facades\Log;
 use Ubxty\AzureAi\Events\AzureKeyRotated;
 use Ubxty\AzureAi\Events\AzureRateLimited;
 use Ubxty\AzureAi\Exceptions\AzureException;
-use Ubxty\CoreAi\Client\HasRetryLogic;
 use Ubxty\CoreAi\Exceptions\RateLimitException;
 use Ubxty\CoreAi\Models\ModelSpecResolver;
+use Ubxty\CoreAi\Standards\OpenAI\OpenAIClient;
 
-class AzureClient
+/**
+ * Azure-specific Chat Completions client.
+ *
+ * Extends core-ai's OpenAIClient and overrides only the Azure-specific
+ * hooks: v1 vs traditional endpoint URL/auth shimming, the
+ * `max_tokens` → `max_completion_tokens` swap, Azure deployment listing,
+ * Azure-friendly error mapping, and the Azure event hooks. The wire
+ * format (request body, SSE parsing, cache-marker injection) is
+ * inherited from core-ai/Standards/OpenAI.
+ *
+ * BC guarantee: every public method that v2.1.x callers used still
+ * exists with the same signature — converse(), converseStream(),
+ * testConnection(), listModels(), fetchModels(), listDeployments(),
+ * getCredentialManager(), setModelsCacheTtl(), setPromptCachePoints(),
+ * setRetryAfterSeconds().
+ */
+class AzureClient extends OpenAIClient
 {
-    use HasRetryLogic;
-
-    protected int $modelsCacheTtl = 3600;
+    private AzureEndpointResolver $endpointResolver;
 
     public function __construct(
         AzureCredentialManager $credentials,
         int $maxRetries = 3,
         int $baseDelay = 2,
+        ?AzureEndpointResolver $endpointResolver = null,
     ) {
-        $this->credentials = $credentials;
-        $this->maxRetries = $maxRetries;
-        $this->baseDelay = $baseDelay;
+        parent::__construct($credentials, $maxRetries, $baseDelay);
+        $this->endpointResolver = $endpointResolver ?? new AzureEndpointResolver();
+    }
+
+    public function platformName(): string
+    {
+        return 'Azure OpenAI';
     }
 
     // ─────────────────────────────────────────────────────────
-    //  Endpoint helpers
+    //  OpenAIClient hooks overridden for Azure
     // ─────────────────────────────────────────────────────────
 
-    /**
-     * Normalize an endpoint URL by stripping any appended resource path.
-     *
-     * Users sometimes copy the full resource URL (e.g. ending in /responses or
-     * /chat/completions) instead of the base v1 URL. We strip those here so the
-     * client always works from the correct base.
-     */
-    private function normalizeEndpoint(string $endpoint): string
+    protected function chatUrl(string $endpoint, string $modelId, array $key): string
     {
-        $base = rtrim($endpoint, '/');
+        $apiVersion = (string) ($key['api_version'] ?? '2024-10-21');
 
-        $knownSuffixes = [
-            '/responses',
-            '/chat/completions',
-            '/embeddings',
-            '/completions',
-            '/audio/speech',
-            '/audio/transcriptions',
-            '/images/generations',
-        ];
+        return $this->endpointResolver->chatUrl($endpoint, $modelId, $apiVersion);
+    }
 
-        foreach ($knownSuffixes as $suffix) {
-            if (str_ends_with($base, $suffix)) {
-                return substr($base, 0, strlen($base) - strlen($suffix));
-            }
+    protected function authHeaders(string $endpoint, array $key, ?string $idempotencyKey): array
+    {
+        $headers = $this->endpointResolver->authHeaders($endpoint, (string) ($key['api_key'] ?? ''))
+            + ['Content-Type' => 'application/json'];
+
+        if ($idempotencyKey !== null && $idempotencyKey !== '') {
+            $headers['Idempotency-Key'] = $idempotencyKey;
         }
 
-        return $base;
+        return $headers;
     }
 
-    /**
-     * Detect whether the endpoint is the AI Foundry OpenAI-compatible v1 style.
-     *
-     * v1 endpoints look like: https://resource.services.ai.azure.com/.../openai/v1
-     * Traditional endpoints:  https://resource.openai.azure.com
-     */
-    private function isV1Endpoint(string $endpoint): bool
+    protected function resolveModelId(string $modelId, array $key): string
     {
-        $normalized = $this->normalizeEndpoint($endpoint);
-
-        return str_ends_with($normalized, '/v1')
-            || str_contains($normalized, '/v1/');
+        return $modelId;
     }
 
     /**
-     * Derive the traditional data-plane base URL from any endpoint style.
+     * Azure-specific request-body adjustment:
+     *   - v1 endpoints use `max_completion_tokens` + a `model` field
+     *   - traditional deployments use `max_tokens` + deployment-in-URL
      *
-     * For v1 endpoints like:
-     *   https://resource.services.ai.azure.com/api/projects/p/openai/v1
-     * → https://resource.services.ai.azure.com/api/projects/p
-     *
-     * For traditional endpoints the normalized value is returned unchanged.
+     * The inherited body shape already has `max_tokens`; we swap it
+     * and add `model` only when the endpoint is v1.
      */
-    private function getDataPlaneBase(string $endpoint): string
-    {
-        $normalized = $this->normalizeEndpoint($endpoint);
-
-        if (preg_match('#^(.+)/openai/v1$#', $normalized, $m)) {
-            return $m[1];
-        }
-
-        return $normalized;
-    }
-
-    /**
-     * Build the chat completions URL for the given endpoint style.
-     */
-    private function buildChatUrl(string $endpoint, string $resolvedId, string $apiVersion): string
-    {
-        $base = $this->normalizeEndpoint($endpoint);
-
-        if ($this->isV1Endpoint($endpoint)) {
-            return "{$base}/chat/completions";
-        }
-
-        return "{$base}/openai/deployments/{$resolvedId}/chat/completions?api-version={$apiVersion}";
-    }
-
-    /**
-     * Get the correct auth headers for the endpoint style.
-     *
-     * v1 endpoints use OpenAI-style Bearer token for chat completions;
-     * data-plane listing endpoints always use api-key header.
-     *
-     * @return array<string, string>
-     */
-    private function getAuthHeaders(string $endpoint, string $apiKey): array
-    {
-        if ($this->isV1Endpoint($endpoint)) {
-            return ['Authorization' => "Bearer {$apiKey}"];
-        }
-
-        return ['api-key' => $apiKey];
-    }
-
-    // ─────────────────────────────────────────────────────────
-    //  Chat completion
-    // ─────────────────────────────────────────────────────────
-
-    /**
-     * Send a chat completion request (non-streaming).
-     *
-     * @param  array<int, array{role: string, content: string|array}>  $messages
-     * @return array{response: string, input_tokens: int, output_tokens: int, total_tokens: int, stop_reason: string, latency_ms: int, model_id: string, key_used: string}
-     */
-    public function converse(
-        string $deploymentId,
+    protected function buildRequest(
         array $messages,
-        string $systemPrompt = '',
-        int $maxTokens = 4096,
-        float $temperature = 0.7,
-        ?string $idempotencyKey = null,
+        string $systemPrompt,
+        int $maxTokens,
+        float $temperature,
+        array $tools,
+        ?\Ubxty\CoreAi\Contracts\ToolChoice $toolChoice,
+        ?\Ubxty\CoreAi\Contracts\StructuredSchema $schema,
+        ?array $cacheAnchors,
+        string $modelId,
+        array $key,
     ): array {
-        $startTime = microtime(true);
+        $body = parent::buildRequest(
+            $messages, $systemPrompt, $maxTokens, $temperature,
+            $tools, $toolChoice, $schema, $cacheAnchors, $modelId, $key,
+        );
 
-        return $this->withRetry($deploymentId, function (string $resolvedId, array $key) use ($messages, $systemPrompt, $maxTokens, $temperature, $idempotencyKey, $startTime) {
-            $endpoint = $key['endpoint'];
-            $apiVersion = $key['api_version'] ?? '2024-10-21';
-            $apiKey = $key['api_key'];
-            $v1 = $this->isV1Endpoint($endpoint);
-
-            $url = $this->buildChatUrl($endpoint, $resolvedId, $apiVersion);
-
-            $formattedMessages = $this->formatMessages($messages, $systemPrompt);
-            [$formattedMessages] = $this->applyCacheControl($formattedMessages);
-
-            $body = [
-                'messages' => $formattedMessages,
-                'temperature' => $temperature,
-            ];
-
-            // Newer models (accessed via v1 endpoints) require max_completion_tokens;
-            // traditional deployments use the legacy max_tokens parameter.
-            if ($v1) {
-                $body['model'] = $resolvedId;
-                $body['max_completion_tokens'] = $maxTokens;
-            } else {
-                $body['max_tokens'] = $maxTokens;
-            }
-
-            $headers = $this->getAuthHeaders($endpoint, $apiKey) + ['Content-Type' => 'application/json'];
-            if ($idempotencyKey !== null && $idempotencyKey !== '') {
-                $headers['Idempotency-Key'] = $idempotencyKey;
-            }
-
-            $response = Http::withHeaders($headers)->timeout(120)->post($url, $body);
-
-            if (! $response->successful()) {
-                $this->handleErrorResponse($response);
-            }
-
-            $data = $response->json();
-            $choice = $data['choices'][0] ?? [];
-            $usage = $data['usage'] ?? [];
-
-            $outputText = $choice['message']['content'] ?? '';
-            $inputTokens = $usage['prompt_tokens'] ?? 0;
-            $outputTokens = $usage['completion_tokens'] ?? 0;
-
-            return [
-                'response' => $outputText,
-                'input_tokens' => $inputTokens,
-                'output_tokens' => $outputTokens,
-                'total_tokens' => $inputTokens + $outputTokens,
-                'stop_reason' => $choice['finish_reason'] ?? 'stop',
-                'latency_ms' => (int) ((microtime(true) - $startTime) * 1000),
-                'model_id' => $resolvedId,
-                'key_used' => $key['label'] ?? 'Primary',
-            ];
-        });
-    }
-
-    /**
-     * Send a streaming chat completion request (SSE).
-     *
-     * @param  array<int, array{role: string, content: string|array}>  $messages
-     * @param  callable(string $chunk): void  $onChunk
-     * @return array{response: string, input_tokens: int, output_tokens: int, total_tokens: int, latency_ms: int, model_id: string, key_used: string}
-     */
-    public function converseStream(
-        string $deploymentId,
-        array $messages,
-        callable $onChunk,
-        string $systemPrompt = '',
-        int $maxTokens = 4096,
-        float $temperature = 0.7,
-        ?string $idempotencyKey = null,
-    ): array {
-        $startTime = microtime(true);
-
-        return $this->withRetry($deploymentId, function (string $resolvedId, array $key) use ($messages, $onChunk, $systemPrompt, $maxTokens, $temperature, $idempotencyKey, $startTime) {
-            $endpoint = $key['endpoint'];
-            $apiVersion = $key['api_version'] ?? '2024-10-21';
-            $apiKey = $key['api_key'];
-            $v1 = $this->isV1Endpoint($endpoint);
-
-            $url = $this->buildChatUrl($endpoint, $resolvedId, $apiVersion);
-
-            $body = [
-                'messages' => $this->formatMessages($messages, $systemPrompt),
-                'temperature' => $temperature,
-                'stream' => true,
-                'stream_options' => ['include_usage' => true],
-            ];
-
-            if ($v1) {
-                $body['model'] = $resolvedId;
-                $body['max_completion_tokens'] = $maxTokens;
-            } else {
-                $body['max_tokens'] = $maxTokens;
-            }
-
-            $authHeaders = $this->getAuthHeaders($endpoint, $apiKey);
-            $curlHeaders = array_map(
-                fn ($k, $v) => "{$k}: {$v}",
-                array_keys($authHeaders),
-                $authHeaders
-            );
-            $curlHeaders[] = 'Content-Type: application/json';
-            $curlHeaders[] = 'Accept: text/event-stream';
-
-            // A6 — forward caller-supplied idempotency key so a network
-            // blip retries as the same request rather than a fresh billing
-            // event. Mirrors the converse() path.
-            if ($idempotencyKey !== null && $idempotencyKey !== '') {
-                $curlHeaders[] = "Idempotency-Key: {$idempotencyKey}";
-            }
-
-            $ch = curl_init();
-            curl_setopt_array($ch, [
-                CURLOPT_URL => $url,
-                CURLOPT_POST => true,
-                CURLOPT_POSTFIELDS => json_encode($body),
-                CURLOPT_HTTPHEADER => $curlHeaders,
-                CURLOPT_RETURNTRANSFER => false,
-                CURLOPT_TIMEOUT => 300,
-                CURLOPT_CONNECTTIMEOUT => 30,
-            ]);
-
-            $fullResponse = '';
-            $inputTokens = 0;
-            $outputTokens = 0;
-            $buffer = '';
-
-            curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) use (&$buffer, &$fullResponse, &$inputTokens, &$outputTokens, $onChunk) {
-                $buffer .= $data;
-
-                while (($pos = strpos($buffer, "\n")) !== false) {
-                    $line = substr($buffer, 0, $pos);
-                    $buffer = substr($buffer, $pos + 1);
-                    $line = trim($line);
-
-                    if ($line === '' || $line === 'data: [DONE]') {
-                        continue;
-                    }
-
-                    if (str_starts_with($line, 'data: ')) {
-                        $json = json_decode(substr($line, 6), true);
-
-                        if (! $json) {
-                            continue;
-                        }
-
-                        // Stream usage tokens (when stream_options.include_usage is true)
-                        if (isset($json['usage'])) {
-                            $inputTokens = $json['usage']['prompt_tokens'] ?? $inputTokens;
-                            $outputTokens = $json['usage']['completion_tokens'] ?? $outputTokens;
-                        }
-
-                        $delta = $json['choices'][0]['delta'] ?? [];
-
-                        if (isset($delta['content'])) {
-                            $text = $delta['content'];
-                            $fullResponse .= $text;
-                            $onChunk($text, ['type' => 'delta']);
-                        }
-                    }
-                }
-
-                return strlen($data);
-            });
-
-            $httpCode = 0;
-            curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($ch, $header) use (&$httpCode) {
-                if (preg_match('/^HTTP\/\S+\s+(\d+)/', $header, $matches)) {
-                    $httpCode = (int) $matches[1];
-                }
-
-                return strlen($header);
-            });
-
-            curl_exec($ch);
-            $curlError = curl_error($ch);
-            curl_close($ch);
-
-            if ($curlError) {
-                throw new AzureException("Azure OpenAI streaming error: {$curlError}");
-            }
-
-            if ($httpCode >= 400) {
-                if ($httpCode === 429) {
-                    throw new RateLimitException('429 Too many requests - rate limited', 429);
-                }
-
-                throw new AzureException("Azure OpenAI HTTP error: {$httpCode}");
-            }
-
-            return [
-                'response' => $fullResponse,
-                'input_tokens' => $inputTokens,
-                'output_tokens' => $outputTokens,
-                'total_tokens' => $inputTokens + $outputTokens,
-                'latency_ms' => (int) ((microtime(true) - $startTime) * 1000),
-                'model_id' => $resolvedId,
-                'key_used' => $key['label'] ?? 'Primary',
-            ];
-        });
-    }
-
-    /**
-     * Test the connection by listing deployments.
-     *
-     * @return array{success: bool, message: string, response_time: int, deployment_count?: int}
-     */
-    public function testConnection(): array
-    {
-        $startTime = microtime(true);
-
-        try {
-            $key = $this->credentials->current();
-            $endpoint = $key['endpoint'];
-            $v1 = $this->isV1Endpoint($endpoint);
-
-            // For AI Foundry v1 endpoints, test with a lightweight chat call
-            // since the deployment listing API isn't available.
-            if ($v1) {
-                $apiKey = $key['api_key'];
-                $base = $this->normalizeEndpoint($endpoint);
-                $defaultModel = config('core-ai.azure_ai.defaults.model', '');
-
-                // If no default model is configured, we can only verify the
-                // endpoint is reachable (the expected error tells us it works).
-                $body = [
-                    'messages' => [['role' => 'user', 'content' => 'hi']],
-                    'max_tokens' => 1,
-                ];
-
-                if ($defaultModel !== '') {
-                    $body['model'] = $defaultModel;
-                }
-
-                $response = Http::withHeaders([
-                    'Authorization' => "Bearer {$apiKey}",
-                    'Content-Type' => 'application/json',
-                ])->timeout(15)->post("{$base}/chat/completions", $body);
-
-                $responseTime = (int) ((microtime(true) - $startTime) * 1000);
-
-                if ($response->successful()) {
-                    $model = $response->json('model') ?? $defaultModel ?: 'unknown';
-
-                    return [
-                        'success' => true,
-                        'message' => "Connection successful! AI Foundry endpoint responding (model: {$model}).",
-                        'response_time' => $responseTime,
-                        'model_count' => 1,
-                    ];
-                }
-
-                // "Missed model deployment" means the endpoint is reachable but
-                // no default model is configured — connection itself is OK.
-                $errorBody = $response->json();
-                $errorMsg = $errorBody['error']['message'] ?? '';
-                if (str_contains(strtolower($errorMsg), 'missed model deployment') || str_contains(strtolower($errorMsg), 'model not found')) {
-                    return [
-                        'success' => true,
-                        'message' => 'Connection successful! AI Foundry endpoint is reachable. Set AZURE_OPENAI_DEFAULT_MODEL in .env to specify a deployment.',
-                        'response_time' => $responseTime,
-                        'model_count' => 0,
-                    ];
-                }
-
-                return [
-                    'success' => false,
-                    'message' => 'AI Foundry endpoint returned HTTP '.$response->status().': '.$errorMsg,
-                    'response_time' => $responseTime,
-                ];
-            }
-
-            // Traditional endpoint: list deployments
-            $deployments = $this->listDeployments();
-            $responseTime = (int) ((microtime(true) - $startTime) * 1000);
-
-            return [
-                'success' => true,
-                'message' => 'Connection successful! Found '.count($deployments).' deployment(s).',
-                'response_time' => $responseTime,
-                'model_count' => count($deployments),
-            ];
-        } catch (\Exception $e) {
-            return [
-                'success' => false,
-                'message' => $e->getMessage(),
-                'response_time' => (int) ((microtime(true) - $startTime) * 1000),
-            ];
+        $endpoint = (string) ($key['endpoint'] ?? '');
+        if ($this->endpointResolver->isV1($endpoint)) {
+            unset($body['max_tokens']);
+            $body['max_completion_tokens'] = $maxTokens;
+            $body['model'] = $modelId;
         }
+
+        return $body;
     }
 
+    // ─────────────────────────────────────────────────────────
+    //  Azure-specific deployment listing
+    // ─────────────────────────────────────────────────────────
+
     /**
-     * List deployed models (deployments) on the Azure OpenAI resource.
-     *
-     * Uses the data-plane endpoint: GET {base}/openai/deployments?api-version=X
-     * Works reliably for traditional endpoints (*.openai.azure.com).
-     * AI Foundry project endpoints may not support this — returns [] gracefully.
+     * List deployed models on the Azure OpenAI resource. AI Foundry
+     * project endpoints don't expose this route, so they degrade
+     * gracefully to an empty list — fetchModels() falls back to the
+     * configured default model in that case.
      *
      * @return array<int, array<string, mixed>>
      */
     public function listDeployments(): array
     {
         $key = $this->credentials->current();
-        $endpoint = $key['endpoint'];
-        $apiVersion = $key['api_version'] ?? '2024-10-21';
-        $apiKey = $key['api_key'];
-        $base = $this->getDataPlaneBase($endpoint);
-        $v1 = $this->isV1Endpoint($endpoint);
+        $endpoint = (string) ($key['endpoint'] ?? '');
+        $apiVersion = (string) ($key['api_version'] ?? '2024-10-21');
+        $apiKey = (string) ($key['api_key'] ?? '');
+        $base = $this->endpointResolver->dataPlaneBase($endpoint);
+        $isV1 = $this->endpointResolver->isV1($endpoint);
 
         return Cache::remember(
             'azure_ai_deployments_'.md5($base.$apiKey),
             $this->modelsCacheTtl,
-            function () use ($base, $apiVersion, $apiKey, $v1) {
+            function () use ($base, $apiVersion, $apiKey, $isV1): array {
                 $url = "{$base}/openai/deployments?api-version={$apiVersion}";
 
-                $response = Http::withHeaders([
-                    'api-key' => $apiKey,
-                ])->get($url);
+                $response = Http::withHeaders(['api-key' => $apiKey])->get($url);
 
-                // AI Foundry project endpoints don't expose a deployment listing route.
-                // Return empty so the caller falls back to the configured default model.
-                if (! $response->successful() && $v1) {
+                if (! $response->successful() && $isV1) {
                     return [];
                 }
 
@@ -487,49 +156,21 @@ class AzureClient
     }
 
     /**
-     * List all available models on the Azure OpenAI resource.
-     *
-     * Uses the data-plane endpoint: GET {base}/openai/models?api-version=X
-     * AI Foundry project endpoints may not support this — returns [] gracefully.
+     * Backwards-compatible alias — kept returning deployments under
+     * the `listModels` name in v2.1.x so callers that called
+     * `AzureClient::listModels()` directly (not via the manager) keep
+     * working.
      *
      * @return array<int, array<string, mixed>>
      */
     public function listModels(): array
     {
-        $key = $this->credentials->current();
-        $endpoint = $key['endpoint'];
-        $apiVersion = $key['api_version'] ?? '2024-10-21';
-        $apiKey = $key['api_key'];
-        $base = $this->getDataPlaneBase($endpoint);
-        $v1 = $this->isV1Endpoint($endpoint);
-
-        return Cache::remember(
-            'azure_ai_models_'.md5($base.$apiKey),
-            $this->modelsCacheTtl,
-            function () use ($base, $apiVersion, $apiKey, $v1) {
-                $url = "{$base}/openai/models?api-version={$apiVersion}";
-
-                $response = Http::withHeaders([
-                    'api-key' => $apiKey,
-                ])->get($url);
-
-                if (! $response->successful() && $v1) {
-                    return [];
-                }
-
-                if (! $response->successful()) {
-                    throw new AzureException(
-                        'Failed to list models: HTTP '.$response->status().' — '.$response->body()
-                    );
-                }
-
-                return $response->json('data') ?? [];
-            }
-        );
+        return $this->listDeployments();
     }
 
     /**
-     * Fetch deployments with normalized structure.
+     * Fetch deployments with the normalized shape used by the model
+     * picker wizard.
      *
      * @return array<int, array{model_id: string, name: string, context_window: int, max_tokens: int, capabilities: array, input_modalities: array, is_active: bool, provider: string}>
      */
@@ -537,28 +178,28 @@ class AzureClient
     {
         $deployments = $this->listDeployments();
 
-        return array_map(function (array $deployment) {
-            $modelName = $deployment['model'] ?? $deployment['id'] ?? '';
-            $deploymentId = $deployment['id'] ?? $modelName;
+        return array_map(function (array $deployment): array {
+            $modelName = (string) ($deployment['model'] ?? $deployment['id'] ?? '');
+            $deploymentId = (string) ($deployment['id'] ?? $modelName);
             $specs = ModelSpecResolver::resolve($modelName);
+            $status = (string) ($deployment['status'] ?? 'succeeded');
 
-            $status = $deployment['status'] ?? 'succeeded';
+            $capabilities = (array) ($specs['capabilities'] ?? ['text']);
+            $inputModalities = (array) ($specs['input_modalities'] ?? ['text']);
 
-            $capabilities = $specs['capabilities'] ?? ['text'];
-            $inputModalities = $specs['input_modalities'] ?? ['text'];
-
-            // Enhance capabilities from model name for common patterns
-            if (str_contains($modelName, 'vision') || str_contains($modelName, 'gpt-4o') || str_contains($modelName, 'gpt-4-turbo')) {
-                if (! in_array('image', $inputModalities)) {
+            if (str_contains($modelName, 'vision')
+                || str_contains($modelName, 'gpt-4o')
+                || str_contains($modelName, 'gpt-4-turbo')) {
+                if (! in_array('image', $inputModalities, true)) {
                     $inputModalities[] = 'image';
                 }
             }
 
             return [
                 'model_id' => $deploymentId,
-                'name' => $deployment['model'] ?? $deploymentId,
-                'context_window' => $specs['context_window'],
-                'max_tokens' => $specs['max_tokens'],
+                'name' => (string) ($deployment['model'] ?? $deploymentId),
+                'context_window' => (int) $specs['context_window'],
+                'max_tokens' => (int) $specs['max_tokens'],
                 'capabilities' => $capabilities,
                 'input_modalities' => $inputModalities,
                 'is_active' => $status === 'succeeded',
@@ -568,8 +209,109 @@ class AzureClient
     }
 
     /**
-     * Set the models cache TTL in seconds.
+     * Probe the connection. For AI Foundry v1 endpoints there's no
+     * `/models` listing route, so we probe via a tiny chat completion
+     * instead. "Missed model deployment" errors are treated as a
+     * reachable-but-unconfigured success.
+     *
+     * @return array{success: bool, message: string, response_time: int, model_count?: int}
      */
+    public function testConnection(): array
+    {
+        $start = microtime(true);
+
+        try {
+            $key = $this->credentials->current();
+            $endpoint = (string) ($key['endpoint'] ?? '');
+            $isV1 = $this->endpointResolver->isV1($endpoint);
+
+            if ($isV1) {
+                $apiKey = (string) ($key['api_key'] ?? '');
+                $base = $this->endpointResolver->normalize($endpoint);
+                $defaultModel = (string) config('core-ai.azure_ai.defaults.model', '');
+
+                $body = [
+                    'messages' => [['role' => 'user', 'content' => 'hi']],
+                    'max_tokens' => 1,
+                ];
+                if ($defaultModel !== '') {
+                    $body['model'] = $defaultModel;
+                }
+
+                $response = Http::withHeaders([
+                    'Authorization' => "Bearer {$apiKey}",
+                    'Content-Type' => 'application/json',
+                ])->timeout(15)->post("{$base}/chat/completions", $body);
+
+                $elapsed = (int) ((microtime(true) - $start) * 1000);
+
+                if ($response->successful()) {
+                    $model = (string) ($response->json('model') ?? $defaultModel ?: 'unknown');
+
+                    return [
+                        'success' => true,
+                        'message' => "Connection successful! AI Foundry endpoint responding (model: {$model}).",
+                        'response_time' => $elapsed,
+                        'model_count' => 1,
+                    ];
+                }
+
+                $errorMsg = (string) ($response->json('error.message') ?? '');
+                if (str_contains(strtolower($errorMsg), 'missed model deployment')
+                    || str_contains(strtolower($errorMsg), 'model not found')) {
+                    return [
+                        'success' => true,
+                        'message' => 'Connection successful! AI Foundry endpoint is reachable. Set AZURE_OPENAI_DEFAULT_MODEL in .env to specify a deployment.',
+                        'response_time' => $elapsed,
+                        'model_count' => 0,
+                    ];
+                }
+
+                return [
+                    'success' => false,
+                    'message' => 'AI Foundry endpoint returned HTTP '.$response->status().': '.$errorMsg,
+                    'response_time' => $elapsed,
+                ];
+            }
+
+            $deployments = $this->listDeployments();
+            $elapsed = (int) ((microtime(true) - $start) * 1000);
+
+            return [
+                'success' => true,
+                'message' => 'Connection successful! Found '.count($deployments).' deployment(s).',
+                'response_time' => $elapsed,
+                'model_count' => count($deployments),
+            ];
+        } catch (\Throwable $e) {
+            return [
+                'success' => false,
+                'message' => $e->getMessage(),
+                'response_time' => (int) ((microtime(true) - $start) * 1000),
+            ];
+        }
+    }
+
+    /**
+     * Public wrapper so {@see \Ubxty\AzureAi\AzureManager::embed()} can
+     * route through the same v1-detection logic.
+     */
+    public function embeddingsUrl(string $deploymentId, string $apiVersion): string
+    {
+        $key = $this->credentials->current();
+        $endpoint = (string) ($key['endpoint'] ?? '');
+
+        return $this->endpointResolver->embeddingsUrl($endpoint, $deploymentId, $apiVersion);
+    }
+
+    public function getCredentialManager(): AzureCredentialManager
+    {
+        /** @var AzureCredentialManager $cm */
+        $cm = $this->credentials;
+
+        return $cm;
+    }
+
     public function setModelsCacheTtl(int $ttl): static
     {
         $this->modelsCacheTtl = $ttl;
@@ -577,211 +319,14 @@ class AzureClient
         return $this;
     }
 
-    /**
-     * Get the credential manager instance.
-     */
-    public function getCredentialManager(): AzureCredentialManager
-    {
-        return $this->credentials;
-    }
-
     // ─────────────────────────────────────────────────────────
-    //  Message formatting (Azure / OpenAI format)
+    //  Azure-specific error mapping (used by parent sendRequest)
     // ─────────────────────────────────────────────────────────
 
     /**
-     * Format messages into the OpenAI chat completions format.
-     *
-     * @param  array<int, array{role: string, content: string|array}>  $messages
-     * @return array<int, array{role: string, content: string|array}>
-     */
-    protected function formatMessages(array $messages, string $systemPrompt = ''): array
-    {
-        $formatted = [];
-
-        if ($systemPrompt !== '') {
-            $formatted[] = ['role' => 'system', 'content' => $systemPrompt];
-        }
-
-        foreach ($messages as $message) {
-            $role = $message['role'] ?? 'user';
-            $content = $message['content'] ?? '';
-
-            if (is_string($content)) {
-                $formatted[] = ['role' => $role, 'content' => $content];
-
-                continue;
-            }
-
-            // Multimodal: convert to OpenAI content array format
-            if (is_array($content)) {
-                $parts = [];
-
-                foreach ($content as $block) {
-                    if (isset($block['text'])) {
-                        $parts[] = ['type' => 'text', 'text' => $block['text']];
-                    } elseif (isset($block['type']) && $block['type'] === 'text') {
-                        $parts[] = $block;
-                    } elseif (isset($block['image'])) {
-                        $parts[] = $this->formatImageBlock($block['image']);
-                    } elseif (isset($block['type']) && $block['type'] === 'image_url') {
-                        $parts[] = $block;
-                    } elseif (isset($block['document'])) {
-                        // Azure OpenAI doesn't natively support document uploads.
-                        // Extract text content if available and send as text.
-                        $parts[] = $this->formatDocumentBlock($block['document']);
-                    }
-                }
-
-                $formatted[] = ['role' => $role, 'content' => $parts];
-
-                continue;
-            }
-
-            $formatted[] = ['role' => $role, 'content' => (string) $content];
-        }
-
-        return $formatted;
-    }
-
-    /**
-     * Format an image block for the OpenAI vision API.
-     */
-    protected function formatImageBlock(array $imageData): array
-    {
-        if (isset($imageData['source']['bytes'])) {
-            $bytes = $imageData['source']['bytes'];
-            $format = $imageData['format'] ?? 'jpeg';
-            $mimeType = "image/{$format}";
-            $base64 = base64_encode($bytes);
-
-            return [
-                'type' => 'image_url',
-                'image_url' => [
-                    'url' => "data:{$mimeType};base64,{$base64}",
-                ],
-            ];
-        }
-
-        if (isset($imageData['url'])) {
-            return [
-                'type' => 'image_url',
-                'image_url' => [
-                    'url' => $imageData['url'],
-                ],
-            ];
-        }
-
-        return ['type' => 'text', 'text' => '[Image could not be processed]'];
-    }
-
-    /**
-     * Format a document block. Azure OpenAI doesn't natively support documents,
-     * so we extract text content and include it inline.
-     */
-    protected function formatDocumentBlock(array $documentData): array
-    {
-        $name = $documentData['name'] ?? 'document';
-
-        if (isset($documentData['source']['bytes'])) {
-            $bytes = $documentData['source']['bytes'];
-            $format = $documentData['format'] ?? 'txt';
-
-            if (in_array($format, ['txt', 'md', 'csv', 'html', 'htm'])) {
-                return [
-                    'type' => 'text',
-                    'text' => "[Document: {$name}]\n\n".$bytes,
-                ];
-            }
-
-            // For binary documents, encode as base64 and notify
-            return [
-                'type' => 'text',
-                'text' => "[Document: {$name} ({$format}, ".strlen($bytes)." bytes) — binary content sent as base64]\n\n".base64_encode($bytes),
-            ];
-        }
-
-        return ['type' => 'text', 'text' => "[Document: {$name} — content not available]"];
-    }
-
-    // ─────────────────────────────────────────────────────────
-    //  Error handling
-    // ─────────────────────────────────────────────────────────
-
-    // ─────────────────────────────────────────────────────────
-    //  Prompt Caching (v2.1.0+)
-    // ─────────────────────────────────────────────────────────
-
-    /**
-     * Inject `cache_control: { type: 'ephemeral' }` markers into the chat body
-     * at the configured named anchors. Azure OpenAI's cache_control marker goes
-     * on individual content items, not on the message envelope.
-     *
-     * Currently supported anchors:
-     *   - 'system'    — add cache_control to the system message's content.
-     *   - 'last_user' — add cache_control to the last user message's last text part.
-     *
-     * @param  array<int, array{role: string, content: string|array<int, mixed>}>  $messages
-     * @return array{0: array<int, array{role: string, content: string|array<int, mixed>}>}
-     */
-    protected function applyCacheControl(array $messages): array
-    {
-        if (empty($this->promptCachePoints)) {
-            return [$messages];
-        }
-
-        if (in_array('system', $this->promptCachePoints, true) && ! empty($messages)
-            && ($messages[0]['role'] ?? null) === 'system') {
-            $messages[0] = $this->annotateMessageContent($messages[0]);
-        }
-
-        if (in_array('last_user', $this->promptCachePoints, true)) {
-            for ($i = count($messages) - 1; $i >= 0; $i--) {
-                if (($messages[$i]['role'] ?? null) === 'user') {
-                    $messages[$i] = $this->annotateMessageContent($messages[$i]);
-                    break;
-                }
-            }
-        }
-
-        return [$messages];
-    }
-
-    /**
-     * Add `cache_control: { type: 'ephemeral' }` to the last eligible content
-     * part of the given message. Plain-string content is converted to a parts
-     * array first. Only text and image_url parts can carry the marker.
-     */
-    protected function annotateMessageContent(array $message): array
-    {
-        $content = $message['content'] ?? '';
-
-        if (is_string($content)) {
-            $content = [['type' => 'text', 'text' => $content]];
-        } elseif (! is_array($content)) {
-            return $message;
-        }
-
-        if (empty($content)) {
-            return $message;
-        }
-
-        // Find the last text or image_url part and attach the cache marker.
-        for ($i = count($content) - 1; $i >= 0; $i--) {
-            $type = $content[$i]['type'] ?? null;
-            if ($type === 'text' || $type === 'image_url') {
-                $content[$i]['cache_control'] = ['type' => 'ephemeral'];
-                break;
-            }
-        }
-
-        $message['content'] = $content;
-
-        return $message;
-    }
-
-    /**
-     * Handle a non-successful HTTP response from Azure.
+     * Map a non-2xx response to the platform's friendly exception. Called
+     * by the parent's sendRequest/sendStreamingRequest when the upstream
+     * returns a non-success status.
      *
      * @throws AzureException|RateLimitException
      */
@@ -789,10 +334,9 @@ class AzureClient
     {
         $status = $response->status();
         $body = $response->json() ?? [];
-        $message = $body['error']['message'] ?? $response->body();
+        $message = (string) ($body['error']['message'] ?? $response->body());
 
         if ($status === 429) {
-            // Honour the upstream Retry-After hint when present (v2.1.0).
             $retryAfter = $response->header('Retry-After');
             if ($retryAfter !== null) {
                 $this->setRetryAfterSeconds((int) $retryAfter);
@@ -802,13 +346,10 @@ class AzureClient
 
         throw new AzureException(
             $this->extractFriendlyError("Azure OpenAI HTTP Error: {$status} - {$message}"),
-            $status,
+            $status
         );
     }
 
-    /**
-     * Extract a user-friendly error message from raw Azure errors.
-     */
     protected function extractFriendlyError(string $errorMessage): string
     {
         $friendlyMessages = [
@@ -831,7 +372,6 @@ class AzureClient
             }
         }
 
-        // Truncate overly long messages
         if (strlen($errorMessage) > 200) {
             return substr($errorMessage, 0, 200).'...';
         }
@@ -840,7 +380,7 @@ class AzureClient
     }
 
     // ─────────────────────────────────────────────────────────
-    //  HasRetryLogic hooks
+    //  HasRetryLogic event hooks
     // ─────────────────────────────────────────────────────────
 
     protected function resetPlatformClient(): void
@@ -875,42 +415,5 @@ class AzureClient
                 waitSeconds: 0,
             ));
         }
-    }
-
-    // ─────────────────────────────────────────────────────────
-    //  Helpers
-    // ─────────────────────────────────────────────────────────
-
-    /**
-     * Map a model name to a provider for grouping.
-     */
-    protected function resolveProvider(string $modelName): string
-    {
-        $modelLower = strtolower($modelName);
-
-        $providerMap = [
-            'gpt-' => 'OpenAI',
-            'o1' => 'OpenAI',
-            'o3' => 'OpenAI',
-            'o4' => 'OpenAI',
-            'dall-e' => 'OpenAI',
-            'whisper' => 'OpenAI',
-            'tts' => 'OpenAI',
-            'text-embedding' => 'OpenAI',
-            'phi-' => 'Microsoft',
-            'llama' => 'Meta',
-            'mistral' => 'Mistral AI',
-            'mixtral' => 'Mistral AI',
-            'cohere' => 'Cohere',
-            'jais' => 'G42',
-        ];
-
-        foreach ($providerMap as $prefix => $provider) {
-            if (str_contains($modelLower, $prefix)) {
-                return $provider;
-            }
-        }
-
-        return 'Other';
     }
 }

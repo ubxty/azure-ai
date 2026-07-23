@@ -578,7 +578,7 @@ public function embed(
 | Traditional | `POST {base}/openai/deployments/{deploymentId}/embeddings?api-version={api_version}` |
 | Foundry v1 | `POST {base}/embeddings` |
 
-The detection lives in `AzureManager::isV1EndpointForEmbed()` — same heuristic as the chat path.
+The detection lives in `AzureEndpointResolver::isV1()` — same heuristic as the chat path.
 
 ### Supported deployments
 

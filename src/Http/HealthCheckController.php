@@ -15,14 +15,14 @@ class HealthCheckController extends Controller
 
             return new JsonResponse([
                 'status' => $result['success'] ? 'ok' : 'error',
-                'platform' => 'Azure OpenAI',
+                'platform' => $manager->platformName(),
                 'message' => $result['message'] ?? '',
                 'response_time_ms' => $result['response_time'] ?? null,
             ], $result['success'] ? 200 : 503);
         } catch (\Exception $e) {
             return new JsonResponse([
                 'status' => 'error',
-                'platform' => 'Azure OpenAI',
+                'platform' => $manager->platformName(),
                 'message' => $e->getMessage(),
             ], 503);
         }
