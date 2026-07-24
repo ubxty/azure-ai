@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and 
 
 ---
 
+## [2.2.6] - 2026-07-24
+
+### Fixed
+- AzureManager::performConverseStream now forwards `$onChunk` (and the cache-key context slot) to `performPlatformCall`. Earlier the 8-arg call silently dropped the streaming closure, so the `azure:chat` reply rendered with 0 input / 0 output tokens and no assistant text.
+
+---
+
 ## [2.1.2] - 2026-07-14
 
 ### Documentation
