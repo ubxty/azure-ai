@@ -105,6 +105,7 @@ class AzureManager extends AbstractAiManager
         return $this->performPlatformCall(
             'converseStream', $modelId, $systemPrompt, $messages,
             $maxTokens, $temperature, $connection, $cachePointsOverride,
+            null, $onChunk,
         );
     }
 
