@@ -337,6 +337,105 @@ class AzureClient extends OpenAIClient
         return $this;
     }
 
+    /**
+     * Legacy v2.1.x converse envelope. Threads modelId into parent
+     * AbstractLLMClient::converse() via the `currentModelId` slot.
+     *
+     * Same shape as {@see \Ubxty\BedrockAi\Client\BedrockClient::converseWithModel()}.
+     * AzureManager::platformConverse() calls this; the parent converse()
+     * signature has no $modelId first-arg, so direct $client->converse($modelId, ...)
+     * would put a string into the messages-array slot.
+     *
+     * @param  array<int, array{role: string, content: string|array}>  $messages
+     * @return array{response: string, input_tokens: int, output_tokens: int, total_tokens: int, cache_read_input_tokens: int, cache_write_input_tokens: int, stop_reason: string, latency_ms: int, model_id: string, key_used: string}
+     */
+    public function converseWithModel(
+        string $modelId,
+        array $messages,
+        string $systemPrompt = '',
+        int $maxTokens = 4096,
+        float $temperature = 0.7,
+        ?string $idempotencyKey = null,
+    ): array {
+        $start = microtime(true);
+        $this->currentModelId = $modelId;
+        $keyLabel = $this->credentials->current()['label'] ?? 'Primary';
+
+        try {
+            $result = parent::converse(
+                messages: $messages,
+                systemPrompt: $systemPrompt,
+                maxTokens: $maxTokens,
+                temperature: $temperature,
+                idempotencyKey: $idempotencyKey,
+            );
+        } finally {
+            $this->currentModelId = null;
+        }
+
+        return [
+            'response' => $result->text,
+            'input_tokens' => $result->usage?->inputTokens ?? 0,
+            'output_tokens' => $result->usage?->outputTokens ?? 0,
+            'total_tokens' => ($result->usage?->inputTokens ?? 0) + ($result->usage?->outputTokens ?? 0),
+            'cache_read_input_tokens' => $result->usage?->cachedReadTokens ?? 0,
+            'cache_write_input_tokens' => $result->usage?->cachedWriteTokens ?? 0,
+            'stop_reason' => $result->finishReason ?? 'stop',
+            'latency_ms' => $result->latencyMs ?: (int) ((microtime(true) - $start) * 1000),
+            'model_id' => $result->modelId ?? $modelId,
+            'key_used' => $result->keyLabel ?: $keyLabel,
+        ];
+    }
+
+    /**
+     * Streaming variant of {@see converseWithModel()}. Same
+     * try/finally pattern to keep currentModelId clean across
+     * rate-limit retries.
+     *
+     * @param  array<int, array{role: string, content: string|array}>  $messages
+     * @param  callable(string $chunk): void  $onChunk
+     * @return array{response: string, input_tokens: int, output_tokens: int, total_tokens: int, cache_read_input_tokens: int, cache_write_input_tokens: int, stop_reason: string, latency_ms: int, model_id: string, key_used: string}
+     */
+    public function converseStreamWithModel(
+        string $modelId,
+        array $messages,
+        callable $onChunk,
+        string $systemPrompt = '',
+        int $maxTokens = 4096,
+        float $temperature = 0.7,
+        ?string $idempotencyKey = null,
+    ): array {
+        $start = microtime(true);
+        $this->currentModelId = $modelId;
+        $keyLabel = $this->credentials->current()['label'] ?? 'Primary';
+
+        try {
+            $result = parent::converseStream(
+                messages: $messages,
+                onDelta: $onChunk,
+                systemPrompt: $systemPrompt,
+                maxTokens: $maxTokens,
+                temperature: $temperature,
+                idempotencyKey: $idempotencyKey,
+            );
+        } finally {
+            $this->currentModelId = null;
+        }
+
+        return [
+            'response' => $result->text,
+            'input_tokens' => $result->usage?->inputTokens ?? 0,
+            'output_tokens' => $result->usage?->outputTokens ?? 0,
+            'total_tokens' => ($result->usage?->inputTokens ?? 0) + ($result->usage?->outputTokens ?? 0),
+            'cache_read_input_tokens' => $result->usage?->cachedReadTokens ?? 0,
+            'cache_write_input_tokens' => $result->usage?->cachedWriteTokens ?? 0,
+            'stop_reason' => $result->finishReason ?? 'stop',
+            'latency_ms' => $result->latencyMs ?: (int) ((microtime(true) - $start) * 1000),
+            'model_id' => $result->modelId ?? $modelId,
+            'key_used' => $result->keyLabel ?: $keyLabel,
+        ];
+    }
+
     // ─────────────────────────────────────────────────────────
     //  Azure-specific error mapping (used by parent sendRequest)
     // ─────────────────────────────────────────────────────────

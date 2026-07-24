@@ -133,7 +133,7 @@ class AzureManager extends AbstractAiManager
     ): array {
         $startTime = microtime(true);
 
-        $result = $this->client($connection)->converse(
+        $result = $this->client($connection)->converseWithModel(
             $modelId,
             [['role' => 'user', 'content' => $userMessage]],
             $systemPrompt,
@@ -167,7 +167,7 @@ class AzureManager extends AbstractAiManager
     ): array {
         $startTime = microtime(true);
 
-        $result = $this->client($connection)->converse(
+        $result = $this->client($connection)->converseWithModel(
             $modelId, $messages, $systemPrompt, $maxTokens, $temperature, $idempotencyKey,
         );
 
@@ -205,7 +205,7 @@ class AzureManager extends AbstractAiManager
             }
         };
 
-        $result = $this->client($connection)->converseStream(
+        $result = $this->client($connection)->converseStreamWithModel(
             $modelId, $messages, $deltaDelegate, $systemPrompt, $maxTokens, $temperature, $idempotencyKey,
         );
 
