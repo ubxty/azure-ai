@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and 
 
 ---
 
+## [2.2.7] - 2026-07-24
+
+### Fixed
+- AzureManager::platformInvoke / platformConverse / platformConverseStream now forward `cache_read_input_tokens` and `cache_write_input_tokens` in their result envelopes. Previously all three dropped the fields, so the `azure:chat` `/stats` panel and per-turn status line never reported cache hits even when Azure auto-cached the prefix.
+
+---
+
 ## [2.2.6] - 2026-07-24
 
 ### Fixed

@@ -153,6 +153,8 @@ class AzureManager extends AbstractAiManager
             'status' => 'success',
             'key_used' => (string) ($result['key_used'] ?? 'unknown'),
             'model_id' => (string) ($result['model_id'] ?? $modelId),
+            'cache_read_input_tokens' => (int) ($result['cache_read_input_tokens'] ?? 0),
+            'cache_write_input_tokens' => (int) ($result['cache_write_input_tokens'] ?? 0),
         ];
     }
 
@@ -181,6 +183,8 @@ class AzureManager extends AbstractAiManager
             'latency_ms' => (int) ($result['latency_ms'] ?? (int) ((microtime(true) - $startTime) * 1000)),
             'model_id' => (string) ($result['model_id'] ?? $modelId),
             'key_used' => (string) ($result['key_used'] ?? 'unknown'),
+            'cache_read_input_tokens' => (int) ($result['cache_read_input_tokens'] ?? 0),
+            'cache_write_input_tokens' => (int) ($result['cache_write_input_tokens'] ?? 0),
         ];
     }
 
@@ -222,6 +226,8 @@ class AzureManager extends AbstractAiManager
             'latency_ms' => (int) ($result['latency_ms'] ?? (int) ((microtime(true) - $startTime) * 1000)),
             'model_id' => (string) ($result['model_id'] ?? $modelId),
             'key_used' => (string) ($result['key_used'] ?? 'unknown'),
+            'cache_read_input_tokens' => (int) ($result['cache_read_input_tokens'] ?? 0),
+            'cache_write_input_tokens' => (int) ($result['cache_write_input_tokens'] ?? 0),
         ];
     }
 
